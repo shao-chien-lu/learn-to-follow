@@ -1,3 +1,4 @@
+import numpy as np
 from pogema import GridConfig
 
 # noinspection PyUnresolvedReferences
@@ -17,6 +18,22 @@ class PlannerConfig(BaseModel):
     use_static_cost: bool = True
     use_dynamic_cost: bool = True
     reset_dynamic_cost: bool = True
+
+
+# Static penalties depend only on the map and obs radius; training cycles over a fixed set of maps,
+# so cache them instead of re-running the O(cells^2) all-pairs BFS on every episode reset.
+_PENALTY_CACHE = {}
+_PENALTY_CACHE_MAX = 256
+
+
+def get_penalties(obstacles, obs_radius, cfg):
+    key = (np.asarray(obstacles, dtype=np.int8).tobytes(), len(obstacles), obs_radius)
+    if key not in _PENALTY_CACHE:
+        if len(_PENALTY_CACHE) >= _PENALTY_CACHE_MAX:
+            _PENALTY_CACHE.pop(next(iter(_PENALTY_CACHE)))
+        pen_calc = planner(obstacles, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost)
+        _PENALTY_CACHE[key] = pen_calc.precompute_penalty_matrix(obs_radius)
+    return _PENALTY_CACHE[key]
 
 
 class Planner:
@@ -39,8 +56,7 @@ class Planner:
             for i, p in enumerate(self.planner):
                 p.set_abs_start(self.starts[i])
             if self.cfg.use_static_cost:
-                pen_calc = planner(self.obstacles, self.cfg.use_static_cost, self.cfg.use_dynamic_cost, self.cfg.reset_dynamic_cost)
-                penalties = pen_calc.precompute_penalty_matrix(obs_radius)
+                penalties = get_penalties(self.obstacles, obs_radius, self.cfg)
                 for p in self.planner:
                     p.set_penalties(penalties)
 

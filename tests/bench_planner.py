@@ -105,10 +105,38 @@ BENCHES = [
 ]
 
 
+def bench_cache(grid, repeats, num_agents=32):
+    """Cost of the per-episode-reset setup: build per-agent planners + obtain penalties (first update() call)."""
+    import follower.planning as planning
+    g = grid.tolist()
+    cfg = planning.PlannerConfig()
+
+    def reset(make, penalties):
+        def run():
+            ps = [make(g, True, True, True) for _ in range(num_agents)]
+            pen = penalties()
+            for p in ps:
+                p.set_penalties(pen)
+        return best_of(run, repeats)
+
+    old = reset(ref_planner, lambda: ref_planner(g, True, True, True).precompute_penalty_matrix(RADIUS))
+    new = reset(new_planner, lambda: new_planner(g, True, True, True).precompute_penalty_matrix(RADIUS))
+    planning._PENALTY_CACHE.clear()
+    planning.get_penalties(g, RADIUS, cfg)  # warm
+    hit = reset(new_planner, lambda: planning.get_penalties(g, RADIUS, cfg))
+    return old * 1e3, new * 1e3, hit * 1e3
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--repeats', type=int, default=5)
     args = ap.parse_args()
+    print('\nEpisode reset (32 agents: planner construction + penalties), ms')
+    print(f'{"map":24s} {"orig":>10s} {"new A*":>10s} {"new+cache":>10s} {"total speedup":>14s}')
+    for map_name, mk in MAPS.items():
+        old, new, hit = bench_cache(mk(), max(1, args.repeats // 2))
+        print(f'{map_name:24s} {old:10.2f} {new:10.2f} {hit:10.2f} {old / hit:13.1f}x')
+    print()
     print(f'{"map":24s} {"benchmark":38s} {"old":>10s} {"new":>10s} {"speedup":>8s}')
     for map_name, mk in MAPS.items():
         grid = mk()
