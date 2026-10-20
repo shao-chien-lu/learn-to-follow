@@ -3,7 +3,7 @@ import gymnasium
 from gymnasium import ObservationWrapper
 from gymnasium.spaces import Box, Dict
 
-from follower.planning import ResettablePlanner, PlannerConfig
+from follower.planning import BatchPlanner, PlannerConfig
 
 
 class PreprocessorConfig(PlannerConfig):
@@ -30,59 +30,13 @@ class FollowerWrapper(ObservationWrapper):
     def __init__(self, env, config: PreprocessorConfig):
         super().__init__(env)
         self._cfg: PreprocessorConfig = config
-        self.re_plan = ResettablePlanner(self._cfg)
-        self.prev_goals = None
+        self.planner = BatchPlanner(self._cfg, self._cfg.intrinsic_target_reward)
         self.intrinsic_reward = None
 
-    @staticmethod
-    def get_relative_xy(x, y, tx, ty, obs_radius):
-        dx, dy = x - tx, y - ty
-        if dx > obs_radius or dx < -obs_radius or dy > obs_radius or dy < -obs_radius:
-            return None, None
-        return obs_radius - dx, obs_radius - dy
-
     def observation(self, observations):
-        # Update cost penalties based on the current observations, independently for each agent.
-        self.re_plan.update(observations)
-
-        # Retrieve the shortest path to the global target for each agent.
-        paths = self.re_plan.get_path()
-
-        new_goals = []  # Initialize a list to store new goals for each agent.
-        intrinsic_rewards = []  # Initialize a list to store intrinsic rewards for each agent.
-
-        # Iterate through agents and their respective paths.
-        for k, path in enumerate(paths):
-            obs = observations[k]
-
-            # Check if there is no valid path available.
-            if path is None:
-                new_goals.append(obs['target_xy'])  # Use the target position as a new goal.
-                path = []
-            else:
-                # Check if the agent reached their subgoal from its previous step
-                subgoal_achieved = self.prev_goals and obs['xy'] == self.prev_goals[k]
-                # Assign an intrinsic reward if conditions are met, otherwise set it to 0.
-                intrinsic_rewards.append(self._cfg.intrinsic_target_reward if subgoal_achieved else 0.0)
-                # Select a new target point.
-                new_goals.append(path[1])
-
-            # Set obstacle values to -1.0 in the observation.
-            obs['obstacles'][obs['obstacles'] > 0] *= -1
-
-            # Adding path to the observation, setting path values to +1.0.
-            r = obs['obstacles'].shape[0] // 2
-            for idx, (gx, gy) in enumerate(path):
-                x, y = self.get_relative_xy(*obs['xy'], gx, gy, r)
-                if x is not None and y is not None:
-                    obs['obstacles'][x, y] = 1.0
-                else:
-                    break
-            # print(obs['obstacles'])
-        # Update the previous goals and intrinsic rewards for the next step.
-        self.prev_goals = new_goals
-        self.intrinsic_reward = intrinsic_rewards
-
+        # One native call re-plans every agent (A* with occupation-based costs), sets obstacles to -1.0, draws each
+        # agent's path as +1.0 into its obstacle channel, and returns the intrinsic rewards (sub-goal reached).
+        self.intrinsic_reward = self.planner.step(observations)
         return observations
 
     def get_intrinsic_rewards(self, reward):
@@ -95,10 +49,9 @@ class FollowerWrapper(ObservationWrapper):
         return self.observation(observation), self.get_intrinsic_rewards(reward), done, tr, info
 
     def reset_state(self):
-        self.re_plan.reset_states()
-        self.re_plan._agent.add_grid_obstacles(self.get_global_obstacles(), self.get_global_agents_xy())
+        self.planner = BatchPlanner(self._cfg, self._cfg.intrinsic_target_reward)
+        self.planner.add_grid_obstacles(self.get_global_obstacles(), self.get_global_agents_xy())
 
-        self.prev_goals = None
         self.intrinsic_reward = None
 
     def reset(self, **kwargs):

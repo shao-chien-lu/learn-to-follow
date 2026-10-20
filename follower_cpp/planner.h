@@ -7,6 +7,8 @@
 #include <list>
 #include <cstdint>
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 #define INF 1000000000
 namespace py = pybind11;
 
@@ -206,15 +208,47 @@ public:
             num_occupations[id(o.first, o.second)] += 1.0f;
     }
 
-    void update_occupations(py::array_t<double, py::array::c_style | py::array::forcecast> array, std::pair<int, int> cur_pos, std::pair<int, int> cur_goal)
+    // Row-major h x w window whose top-left corner is cur_pos (relative coords). With zero_center the middle cell is
+    // ignored, which is what the python code did by temporarily zeroing the agent's own cell.
+    template<typename T>
+    void add_occupations(const T* a, py::ssize_t h, py::ssize_t w, std::pair<int, int> cur_pos, std::pair<int, int> cur_goal, bool zero_center)
     {
         reset_occupations_if_new_goal(id(cur_goal.first + abs_offset.first, cur_goal.second + abs_offset.second));
-        auto a = array.unchecked<2>();
         int pi = cur_pos.first + abs_offset.first, pj = cur_pos.second + abs_offset.second;
-        for(py::ssize_t i = 0; i < a.shape(0); i++)
-            for(py::ssize_t j = 0; j < a.shape(1); j++)
-                if(a(i, j) != 0)
+        for(py::ssize_t i = 0; i < h; i++)
+            for(py::ssize_t j = 0; j < w; j++)
+                if(a[i * w + j] != 0 and not (zero_center and i == h / 2 and j == w / 2))
                     num_occupations[id(pi + i, pj + j)] += 1.0f;
+    }
+
+    void update_occupations(py::array_t<double, py::array::c_style | py::array::forcecast> array, std::pair<int, int> cur_pos, std::pair<int, int> cur_goal)
+    {
+        if(array.ndim() != 2)
+            throw std::invalid_argument("occupations must be a 2D array");
+        add_occupations(array.data(), array.shape(0), array.shape(1), cur_pos, cur_goal, false);
+    }
+
+    void set_penalties_flat(const float* p)
+    {
+        penalties.assign(p, p + (size_t)H * W);
+    }
+
+    // Node ids on the current path, start first and goal last; empty if there is no path (same cases as get_path).
+    void path_ids(std::vector<int>& out) const
+    {
+        out.clear();
+        if(g_of(goal) < INF and goal != start)
+        {
+            for(int n = goal; n != start; n = parent_[n])
+                out.push_back(n);
+            out.push_back(start);
+            std::reverse(out.begin(), out.end());
+        }
+    }
+
+    std::pair<int, int> to_rel(int n) const
+    {
+        return {n / W - abs_offset.first, n % W - abs_offset.second};
     }
 
     void update_path(std::pair<int, int> s, std::pair<int, int> g)
@@ -254,5 +288,97 @@ public:
     void set_abs_start(std::pair<int, int> offset)
     {
         abs_offset = offset;
+    }
+};
+
+// One planner per agent, driven for all agents with a single call per environment step. Does what
+// FollowerWrapper.observation used to do in python for every agent: update occupations, re-plan, draw the path into
+// the obstacle channel, and compute the intrinsic reward (+1 if the agent reached the sub-goal chosen last step).
+class multi_planner
+{
+    std::vector<planner> ps;
+    std::vector<std::pair<int, int>> prev_goals;
+    bool has_prev = false;
+    double intrinsic_target_reward;
+    std::vector<int> path_buf;
+    int H, W;
+
+public:
+    multi_planner(std::vector<std::vector<int>> grid, bool use_static_cost, bool use_dynamic_cost, bool reset_dynamic_cost,
+                  std::vector<std::pair<int, int>> starts, double _intrinsic_target_reward):
+    intrinsic_target_reward(_intrinsic_target_reward)
+    {
+        H = grid.size();
+        W = grid.front().size();
+        ps.reserve(starts.size());
+        for(auto& s: starts)
+        {
+            ps.emplace_back(grid, use_static_cost, use_dynamic_cost, reset_dynamic_cost);
+            ps.back().set_abs_start(s);
+        }
+        prev_goals.assign(starts.size(), {0, 0});
+    }
+
+    void set_penalties(py::array_t<float, py::array::c_style | py::array::forcecast> pen)
+    {
+        if(pen.ndim() != 2 or pen.shape(0) != H or pen.shape(1) != W)
+            throw std::invalid_argument("penalties shape must match the grid");
+        for(auto& p: ps)
+            p.set_penalties_flat(pen.data());
+    }
+
+    // agents / obstacles: float32 (N, R, R), modified in place (agents: own cell set to 1 for re-planned agents;
+    // obstacles: obstacles negated, path drawn as +1). xy / target: (N, 2). Returns the intrinsic rewards (N,).
+    py::array_t<double> step(py::array_t<float, py::array::c_style> agents, py::array_t<float, py::array::c_style> obstacles,
+                             py::array_t<long long, py::array::c_style | py::array::forcecast> xy,
+                             py::array_t<long long, py::array::c_style | py::array::forcecast> target)
+    {
+        py::ssize_t n = ps.size();
+        if(agents.ndim() != 3 or agents.shape(0) != n or agents.shape(1) != agents.shape(2) or obstacles.ndim() != 3 or
+           obstacles.shape(0) != n or obstacles.shape(1) != agents.shape(1) or obstacles.shape(2) != agents.shape(2) or
+           xy.ndim() != 2 or xy.shape(0) != n or xy.shape(1) != 2 or target.ndim() != 2 or target.shape(0) != n or target.shape(1) != 2)
+            throw std::invalid_argument("expected agents/obstacles (N, R, R) and xy/target (N, 2), with N == number of agents");
+        const int R = agents.shape(1), r = R / 2;
+        float* A = agents.mutable_data();
+        float* O = obstacles.mutable_data();
+        const long long* XY = xy.data();
+        const long long* T = target.data();
+        py::array_t<double> rewards(n);
+        double* rew = rewards.mutable_data();
+        std::vector<std::pair<int, int>> new_goals(n);
+
+        for(py::ssize_t k = 0; k < n; k++)
+        {
+            planner& p = ps[k];
+            float* a = A + k * R * R;
+            float* o = O + k * R * R;
+            std::pair<int, int> pos(XY[2 * k], XY[2 * k + 1]), goal(T[2 * k], T[2 * k + 1]);
+            if(pos != goal)
+            {
+                p.add_occupations(a, R, R, {pos.first - r, pos.second - r}, goal, true);
+                a[r * R + r] = 1.0f;
+                p.update_path(pos, goal);
+            }
+            p.path_ids(path_buf);
+            if(path_buf.size() < 2)
+                throw std::out_of_range("no path with a next node for agent " + std::to_string(k));
+            rew[k] = (has_prev and prev_goals[k] == pos) ? intrinsic_target_reward : 0.0;
+            new_goals[k] = p.to_rel(path_buf[1]);
+
+            for(int i = 0; i < R * R; i++)
+                if(o[i] > 0)
+                    o[i] = -o[i];
+            for(int node: path_buf)
+            {
+                auto g = p.to_rel(node);
+                int dx = pos.first - g.first, dy = pos.second - g.second;
+                if(dx > r or dx < -r or dy > r or dy < -r)
+                    break;
+                o[(r - dx) * R + (r - dy)] = 1.0f;
+            }
+        }
+        prev_goals = std::move(new_goals);
+        has_prev = true;
+        return rewards;
     }
 };
