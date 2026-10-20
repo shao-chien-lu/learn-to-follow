@@ -126,5 +126,6 @@ py::class_<Follower>(m, "Follower")
 <%
 cfg['libraries'] = ['onnxruntime']
 cfg['extra_compile_args'] = ['-std=c++17']
+cfg['dependencies'] = ['follower.h', 'planner.h', 'NN_module.h', 'config.h', 'agent.h']
 setup_pybind11(cfg)
 %>

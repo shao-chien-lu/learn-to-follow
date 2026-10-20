@@ -1,279 +1,256 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <pybind11/stl_bind.h>
 #include <pybind11/numpy.h>
 #include <vector>
 #include <queue>
 #include <cmath>
-#include <set>
-#include <map>
 #include <list>
-#include <iostream>
+#include <cstdint>
+#include <algorithm>
 #define INF 1000000000
 namespace py = pybind11;
 
-struct Node {
-    Node(int _i = INF, int _j = INF, float _g = INF, float _h = 0) : i(_i), j(_j), g(_g), h(_h), f(_g+_h){}
-    int i;
-    int j;
+// Same ordering semantics as the original Node (f, then g, with 1e-5 epsilon),
+// but without the parent field so heap entries are smaller.
+struct QNode {
+    int idx;
     float g;
-    float h;
     float f;
-    std::pair<int, int> parent;
-    bool operator<(const Node& other) const
+    bool operator>(const QNode& o) const
     {
-        return this->f < other.f or (std::abs(this->f - other.f) < 1e-5 and this->g < other.g);
-    }
-    bool operator>(const Node& other) const
-    {
-        return this->f > other.f or (std::abs(this->f - other.f) < 1e-5 and this->g > other.g);
-    }
-    bool operator==(const Node& other) const
-    {
-        return this->i == other.i and this->j == other.j;
-    }
-    bool operator==(const std::pair<int, int> &other) const
-    {
-        return this->i == other.first and this->j == other.second;
+        return f > o.f or (std::abs(f - o.f) < 1e-5 and g > o.g);
     }
 };
 
 class planner
 {
-    std::pair<int, int> start;
-    std::pair<int, int> goal;
+    int H, W;
+    int start, goal;
     std::pair<int, int> abs_offset;
-    std::priority_queue<Node, std::vector<Node>, std::greater<Node>> OPEN;
-    std::vector<std::vector<int>> grid;
-    std::vector<std::vector<float>> num_occupations;
-    std::vector<std::vector<float>> penalties;
-    std::vector<std::vector<float>> h_values;
-    std::vector<std::vector<Node>> nodes;
+    std::vector<uint8_t> free_;            // 1 = traversable
+    std::vector<float> num_occupations;
+    std::vector<float> penalties;
+    std::vector<float> h_values;
+    std::vector<float> g_;
+    std::vector<int> parent_;
+    std::vector<uint32_t> stamp_;          // lazy reset: g_/parent_ valid only if stamp_ == search_id
+    uint32_t search_id = 0;
+    std::vector<QNode> heap_;              // reused storage for the open list
     bool use_static_cost;
     bool use_dynamic_cost;
     bool reset_dynamic_cost;
-    inline float h(std::pair<int, int> n)
-    {
-        //return abs(n.first - goal.first) + abs(n.second - goal.second);
-        return h_values[n.first][n.second];
-    }
-    std::vector<std::pair<int,int>> get_neighbors(std::pair<int, int> node)
-    {
-        std::vector<std::pair<int,int>> neighbors;
-        std::vector<std::pair<int,int>> deltas = {{0,1},{1,0},{-1,0},{0,-1}};
-        for(auto d:deltas)
-        {
-            std::pair<int,int> n(node.first + d.first, node.second + d.second);
-            if(grid[n.first][n.second] == 0)
-                neighbors.push_back(n);
-        }
-        return neighbors;
-    }
+    int d4[4];
+
+    inline int id(int i, int j) const { return i * W + j; }
+    inline float g_of(int n) const { return stamp_[n] == search_id ? g_[n] : (float)INF; }
+
+    void push(std::vector<QNode>& h, QNode n) { h.push_back(n); std::push_heap(h.begin(), h.end(), std::greater<QNode>()); }
+    QNode pop(std::vector<QNode>& h) { std::pop_heap(h.begin(), h.end(), std::greater<QNode>()); QNode n = h.back(); h.pop_back(); return n; }
+
     void compute_shortest_path()
     {
-        Node current;
-        while(!OPEN.empty() and !(current == goal))
+        ++search_id;
+        heap_.clear();
+        // NOTE: like the original, the start cell's g is left at INF, so it can be re-reached from a neighbour
+        // and re-expanded. Kept on purpose: it changes heap tie-breaking, and we want bit-identical paths.
+        stamp_[start] = search_id; g_[start] = (float)INF; parent_[start] = -1;
+        push(heap_, {start, 0.f, 0.f + h_values[start]});
+        while(!heap_.empty())
         {
-            current = OPEN.top();
-            OPEN.pop();
-            if(nodes[current.i][current.j].g < current.g)
+            QNode cur = pop(heap_);
+            if(g_[cur.idx] < cur.g)
                 continue;
-            for(auto n: get_neighbors({current.i, current.j})) {
+            if(cur.idx == goal)
+                break;  // expanding the goal cannot change any node on the goal's parent chain
+            for(int k = 0; k < 4; k++) {
+                int n = cur.idx + d4[k];
+                if(!free_[n])
+                    continue;
                 float cost(1);
                 if(use_static_cost)
-                    cost = penalties[n.first][n.second];
+                    cost = penalties[n];
                 if(use_dynamic_cost)
-                    cost += num_occupations[n.first][n.second];
-                if(nodes[n.first][n.second].g > current.g + cost)
+                    cost += num_occupations[n];
+                float ng = cur.g + cost;
+                if(g_of(n) > ng)
                 {
-                    OPEN.push(Node(n.first, n.second, current.g + cost, h(n)));
-                    nodes[n.first][n.second].g = current.g + cost;
-                    nodes[n.first][n.second].parent = {current.i, current.j};
+                    stamp_[n] = search_id; g_[n] = ng; parent_[n] = cur.idx;
+                    push(heap_, {n, ng, ng + h_values[n]});
                 }
             }
         }
     }
 
-    float get_avg_distance(int si, int sj)
+    void update_h_values(int g)
     {
-        std::queue<std::pair<int, int>> fringe;
-        fringe.emplace(si, sj);
-        auto result = std::vector<std::vector<int>>(grid.size(), std::vector<int>(grid.front().size(), -1));
-        result[si][sj] = 0;
-        std::vector<std::pair<int, int>> moves = {{0,1},{1,0},{-1,0},{0,-1}};
-        while(!fringe.empty())
-        {
-            auto pos = fringe.front();
-            fringe.pop();
-            for(const auto& move: moves)
-            {
-                int new_i(pos.first + move.first), new_j(pos.second + move.second);
-                if(grid[new_i][new_j] == 0 && result[new_i][new_j] < 0)
-                {
-                    result[new_i][new_j] = result[pos.first][pos.second] + 1;
-                    fringe.emplace(new_i, new_j);
-                }
-            }
-        }
-        float avg_dist(0), total_nodes(0);
-        for(size_t i = 0; i < grid.size(); i++)
-            for(size_t j = 0; j < grid[0].size(); j++)
-                if(result[i][j] > 0)
-                {
-                    avg_dist += result[i][j];
-                    total_nodes++;
-                }
-        return avg_dist/total_nodes;
-    }
-
-    void update_h_values(std::pair<int, int> g)
-    {
-        std::priority_queue<Node, std::vector<Node>, std::greater<Node>> open;
-        h_values = std::vector<std::vector<float>>(grid.size(), std::vector<float>(grid.front().size(), INF));
-        h_values[g.first][g.second] = 0;
-        open.push(Node(g.first, g.second, 0, 0));
+        std::fill(h_values.begin(), h_values.end(), (float)INF);
+        std::vector<QNode> open;
+        open.reserve(H * W / 4);
+        h_values[g] = 0;
+        push(open, {g, 0.f, 0.f});
         while(!open.empty())
         {
-            Node current = open.top();
-            open.pop();
-            for(auto n: get_neighbors({current.i, current.j})) {
+            QNode cur = pop(open);
+            if(h_values[cur.idx] < cur.g)
+                continue;
+            for(int k = 0; k < 4; k++) {
+                int n = cur.idx + d4[k];
+                if(!free_[n])
+                    continue;
                 float cost(1);
                 if(use_static_cost)
-                    cost = penalties[n.first][n.second];
-                if(h_values[n.first][n.second] > current.g + cost)
+                    cost = penalties[n];
+                if(h_values[n] > cur.g + cost)
                 {
-                    open.push(Node(n.first, n.second, current.g + cost, 0));
-                    h_values[n.first][n.second] = current.g + cost;
+                    h_values[n] = cur.g + cost;
+                    push(open, {n, cur.g + cost, cur.g + cost});
                 }
             }
         }
     }
 
-    void reset()
+    std::vector<std::vector<float>> to_2d(const std::vector<float>& v) const
     {
-        nodes = std::vector<std::vector<Node>>(grid.size(), std::vector<Node>(grid.front().size(), Node()));
-        OPEN = std::priority_queue<Node, std::vector<Node>, std::greater<Node>>();
-        Node s = Node(start.first, start.second, 0, h(start));
-        OPEN.push(s);
+        std::vector<std::vector<float>> r(H, std::vector<float>(W));
+        for(int i = 0; i < H; i++)
+            for(int j = 0; j < W; j++)
+                r[i][j] = v[id(i, j)];
+        return r;
+    }
+
+    void reset_occupations_if_new_goal(int cur_goal)
+    {
+        if(reset_dynamic_cost and goal != cur_goal)
+            std::fill(num_occupations.begin(), num_occupations.end(), 0.f);
     }
 
 public:
-    planner(std::vector<std::vector<int>> _grid={}, float _use_static_cost=1.0, float _use_dynamic_cost=1.0, bool _reset_dynamic_cost=true):
-    grid(_grid), use_static_cost(_use_static_cost), use_dynamic_cost(_use_dynamic_cost), reset_dynamic_cost(_reset_dynamic_cost)
+    planner(std::vector<std::vector<int>> _grid={}, bool _use_static_cost=true, bool _use_dynamic_cost=true, bool _reset_dynamic_cost=true):
+    use_static_cost(_use_static_cost), use_dynamic_cost(_use_dynamic_cost), reset_dynamic_cost(_reset_dynamic_cost)
     {
+        H = _grid.size();
+        W = _grid.front().size();
+        d4[0] = 1; d4[1] = W; d4[2] = -W; d4[3] = -1;   // same neighbor order as the original
+        free_.assign(H * W, 0);
+        for(int i = 0; i < H; i++)
+            for(int j = 0; j < W; j++)
+                free_[id(i, j)] = _grid[i][j] == 0;
         abs_offset = {0, 0};
-        goal = {0,0};
-        start = {0, 0};
-        nodes = std::vector<std::vector<Node>>(grid.size(), std::vector<Node>(grid.front().size(), Node()));
-        num_occupations = std::vector<std::vector<float>>(grid.size(), std::vector<float>(grid.front().size(), 0));
-        penalties = std::vector<std::vector<float>>(grid.size(), std::vector<float>(grid.front().size(), 1));
+        goal = 0;
+        start = 0;
+        num_occupations.assign(H * W, 0.f);
+        penalties.assign(H * W, 1.f);
+        h_values.assign(H * W, (float)INF);
+        g_.assign(H * W, (float)INF);
+        parent_.assign(H * W, -1);
+        stamp_.assign(H * W, 0);
     }
 
     std::vector<std::vector<float>> get_num_occupied_matrix()
     {
-        return num_occupations;
+        return to_2d(num_occupations);
     }
 
     std::vector<std::vector<float>> precompute_penalty_matrix(int obs_radius)
     {
-        penalties = std::vector<std::vector<float>>(grid.size(), std::vector<float>(grid.front().size(), 0));
+        std::vector<float> pen(H * W, 0.f);
+        std::vector<int> dist(H * W, -1), fringe(H * W);
         float max_avg_dist(0);
-        for(size_t i = obs_radius; i < grid.size() - obs_radius; i++)
-            for(size_t j = obs_radius; j < grid.front().size() - obs_radius; j++)
-                if(grid[i][j] == 0)
+        for(int i = obs_radius; i < H - obs_radius; i++)
+            for(int j = obs_radius; j < W - obs_radius; j++)
+            {
+                int s = id(i, j);
+                if(!free_[s])
+                    continue;
+                dist[s] = 0;
+                int head = 0, tail = 0;
+                fringe[tail++] = s;
+                long long sum = 0;
+                while(head < tail)
                 {
-                    penalties[i][j] = get_avg_distance(i, j);
-                    max_avg_dist = std::fmax(max_avg_dist, penalties[i][j]);
+                    int p = fringe[head++];
+                    sum += dist[p];
+                    for(int k = 0; k < 4; k++) {
+                        int n = p + d4[k];
+                        if(free_[n] && dist[n] < 0) {
+                            dist[n] = dist[p] + 1;
+                            fringe[tail++] = n;
+                        }
+                    }
                 }
-        for(size_t i = obs_radius; i < grid.size() - obs_radius; i++)
-            for(size_t j = obs_radius; j < grid.front().size() - obs_radius; j++)
-                if(grid[i][j] == 0)
-                    penalties[i][j] = max_avg_dist / penalties[i][j];
-        return penalties;
+                for(int q = 0; q < tail; q++)   // reset only the cells we touched
+                    dist[fringe[q]] = -1;
+                // Integer sum is exact; equals the original float accumulation while the sum < 2^24.
+                pen[s] = (float)sum / (float)(tail - 1);
+                max_avg_dist = std::fmax(max_avg_dist, pen[s]);
+            }
+        for(int i = obs_radius; i < H - obs_radius; i++)
+            for(int j = obs_radius; j < W - obs_radius; j++)
+                if(free_[id(i, j)])
+                    pen[id(i, j)] = max_avg_dist / pen[id(i, j)];
+        penalties = pen;
+        return to_2d(pen);
     }
 
     void set_penalties(std::vector<std::vector<float>> _penalties)
     {
-        penalties = std::move(_penalties);
+        for(int i = 0; i < H; i++)
+            for(int j = 0; j < W; j++)
+                penalties[id(i, j)] = _penalties[i][j];
     }
 
     void update_occupied_cells(const std::list<std::pair<int, int>>& _occupied_cells, std::pair<int, int> cur_goal)
     {
-        if(reset_dynamic_cost)
-            if(goal.first != cur_goal.first || goal.second != cur_goal.second)
-                num_occupations = std::vector<std::vector<float>>(grid.size(), std::vector<float>(grid.front().size(), 0));
+        reset_occupations_if_new_goal(id(cur_goal.first, cur_goal.second));
         for(auto o:_occupied_cells)
-            num_occupations[o.first][o.second] += 1.0;
+            num_occupations[id(o.first, o.second)] += 1.0f;
     }
 
-    void update_occupations(py::array_t<double> array, std::pair<int, int> cur_pos, std::pair<int, int> cur_goal)
+    void update_occupations(py::array_t<double, py::array::c_style | py::array::forcecast> array, std::pair<int, int> cur_pos, std::pair<int, int> cur_goal)
     {
-        cur_goal = {cur_goal.first + abs_offset.first, cur_goal.second + abs_offset.second};
-        if(reset_dynamic_cost)
-            if(goal.first != cur_goal.first || goal.second != cur_goal.second)
-                num_occupations = std::vector<std::vector<float>>(grid.size(), std::vector<float>(grid.front().size(), 0));
-        py::buffer_info buf = array.request();
-        std::list<std::pair<int, int>> occupied_cells;
-        double *ptr = (double *) buf.ptr;
-        cur_pos = {cur_pos.first + abs_offset.first, cur_pos.second + abs_offset.second};
-        for(size_t i = 0; i < static_cast<size_t>(buf.shape[0]); i++)
-            for(size_t j = 0; j < static_cast<size_t>(buf.shape[1]); j++)
-                if(ptr[i*buf.shape[1] + j] != 0)
-                    occupied_cells.push_back({cur_pos.first + i, cur_pos.second + j});
-        for(auto o:occupied_cells)
-            num_occupations[o.first][o.second]+= 1.0;
+        reset_occupations_if_new_goal(id(cur_goal.first + abs_offset.first, cur_goal.second + abs_offset.second));
+        auto a = array.unchecked<2>();
+        int pi = cur_pos.first + abs_offset.first, pj = cur_pos.second + abs_offset.second;
+        for(py::ssize_t i = 0; i < a.shape(0); i++)
+            for(py::ssize_t j = 0; j < a.shape(1); j++)
+                if(a(i, j) != 0)
+                    num_occupations[id(pi + i, pj + j)] += 1.0f;
     }
 
     void update_path(std::pair<int, int> s, std::pair<int, int> g)
     {
-        s = {s.first + abs_offset.first, s.second + abs_offset.second};
-        g = {g.first + abs_offset.first, g.second + abs_offset.second};
-        start = s;
-        if(goal != g)
-            update_h_values(g);
-        goal = g;
-        reset();
+        start = id(s.first + abs_offset.first, s.second + abs_offset.second);
+        int ng = id(g.first + abs_offset.first, g.second + abs_offset.second);
+        if(goal != ng)
+            update_h_values(ng);
+        goal = ng;
         compute_shortest_path();
     }
 
     std::list<std::pair<int, int>> get_path()
     {
         std::list<std::pair<int, int>> path;
-        std::pair<int, int> next_node(INF,INF);
-        if(nodes[goal.first][goal.second].g < INF)
-            next_node = goal;
-        if(next_node.first < INF and (next_node.first != start.first or next_node.second != start.second))
+        if(g_of(goal) < INF and goal != start)
         {
-            while (nodes[next_node.first][next_node.second].parent != start) {
-                path.push_back(next_node);
-                next_node = nodes[next_node.first][next_node.second].parent;
-            }
-            path.push_back(next_node);
-            path.push_back(start);
-            path.reverse();
-        }
-        for(auto it = path.begin(); it != path.end(); it++)
-        {
-            it->first -= abs_offset.first;
-            it->second -= abs_offset.second;
+            int n = goal;
+            for(; n != start; n = parent_[n])
+                path.push_front({n / W - abs_offset.first, n % W - abs_offset.second});
+            path.push_front({n / W - abs_offset.first, n % W - abs_offset.second});
         }
         return path;
     }
+
     std::pair<std::pair<int, int>, std::pair<int, int>> get_next_node()
     {
-        std::pair<int, int> next_node(INF, INF);
-        if(nodes[goal.first][goal.second].g < INF)
-            next_node = goal;
-        if(next_node.first < INF and (next_node.first != start.first or next_node.second != start.second))
-            while (nodes[next_node.first][next_node.second].parent != start)
-                next_node = nodes[next_node.first][next_node.second].parent;
-        if(next_node == start)
-            next_node = {INF, INF};
-        if(next_node.first < INF)
-            return {{start.first - abs_offset.first, start.second - abs_offset.second},
-                    {next_node.first - abs_offset.first, next_node.second - abs_offset.second}};
-        return {{INF, INF}, {INF, INF}};
+        if(g_of(goal) >= INF or goal == start)
+            return {{INF, INF}, {INF, INF}};
+        int n = goal;
+        while(parent_[n] != start)
+            n = parent_[n];
+        return {{start / W - abs_offset.first, start % W - abs_offset.second},
+                {n / W - abs_offset.first, n % W - abs_offset.second}};
     }
+
     void set_abs_start(std::pair<int, int> offset)
     {
         abs_offset = offset;

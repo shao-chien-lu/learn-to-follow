@@ -14,6 +14,7 @@ PYBIND11_MODULE(planner, m) {
 }
 
 <%
-cfg['extra_compile_args'] = ['-std=c++17']
+cfg['extra_compile_args'] = ['-std=c++17', '-O3']
+cfg['dependencies'] = ['planner.h']
 setup_pybind11(cfg)
 %>
