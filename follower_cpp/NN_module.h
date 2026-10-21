@@ -71,19 +71,10 @@ public:
         std::vector<Ort::Value> inputTensors;
         for(size_t k = 0; k < input_shapes.size(); k++)
             inputTensors.push_back(Ort::Value::CreateTensor<float>(memoryInfo, input[k].data(), input[k].size(), input_shapes[k].data(), input_shapes[k].size()));
-        std::vector<std::vector<float>> outputTensorValues;
-        for(auto shape:output_shapes)
-        {
-            int output_size(1);
-            for(auto s:shape)
-                output_size *= s;
-            outputTensorValues.push_back(std::vector<float>(output_size, 0));
-        }
-        std::vector<Ort::Value> outputTensors;
-        for(size_t k = 0; k < output_shapes.size(); k++)
-            outputTensors.push_back(Ort::Value::CreateTensor<float>(memoryInfo, outputTensorValues[k].data(), outputTensorValues[k].size(), output_shapes[k].data(), output_shapes[k].size()));
+        // ORT allocates the outputs: preallocating them all as float buffers let it write the int64 'actions' output
+        // 4 bytes past its buffer, corrupting the heap
         auto t1 = std::chrono::high_resolution_clock::now();
-        mSession->Run(Ort::RunOptions{nullptr}, input_names.data(), inputTensors.data(), inputTensors.size(), output_names.data(),outputTensors.data(), outputTensors.size());
+        auto outputTensors = mSession->Run(Ort::RunOptions{nullptr}, input_names.data(), inputTensors.data(), inputTensors.size(), output_names.data(), output_names.size());
         auto t2 = std::chrono::high_resolution_clock::now();
         total_time += std::chrono::duration_cast<std::chrono::nanoseconds>(t2-t1).count();
         float *floatarr = outputTensors[1].GetTensorMutableData<float>();
