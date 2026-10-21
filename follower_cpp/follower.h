@@ -30,6 +30,8 @@ class Follower {
 public:
     explicit Follower(): pool(BS::thread_pool(cfg.num_threads)){}
     void init(const Config& cfg_, py::array_t<double> array, std::vector<std::pair<int, int>> abs_starts);
+    void set_state(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals);
+    std::vector<float> observe(size_t agent_idx, int radius);
     std::vector<int> act(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals);
 };
 

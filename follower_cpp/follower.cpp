@@ -1,19 +1,16 @@
 // cppimport
 #include "follower.h"
 
+// Read from agents_pos rather than the agent list, so that the occupation costs see the same agents as training does
+// (the pogema agents window, see set_state).
 std::list<std::pair<int, int>> Follower::get_occupied_cells(int agent_idx)
 {
     std::pair<int, int> cur_pos = agents[agent_idx].cur_position;
     std::list<std::pair<int, int>> result;
-    for(auto & agent : agents) {
-        int di = std::abs(agent.cur_position.first - cur_pos.first);
-        int dj = std::abs(agent.cur_position.second - cur_pos.second);
-        if(di <= cfg.obs_radius && dj <= cfg.obs_radius) {
-            if(di == 0 && dj == 0)
-                continue;
-            result.push_back(agent.cur_position);
-        }
-    }
+    for(int i = cur_pos.first - cfg.obs_radius; i <= cur_pos.first + cfg.obs_radius; i++)
+        for(int j = cur_pos.second - cfg.obs_radius; j <= cur_pos.second + cfg.obs_radius; j++)
+            if(agents_pos[i][j] && std::make_pair(i, j) != cur_pos)
+                result.push_back({i, j});
     return result;
 }
 
@@ -29,25 +26,34 @@ std::vector<float> Follower::generate_input(int a_id, int radius, std::list<std:
             if(agents_pos[agents[a_id].cur_position.first + i][agents[a_id].cur_position.second + j])
                 input[(i + radius) * obs_size + j + radius + obs_size * obs_size] = 1;
         }
-    if(!path.empty())
+    // as in training: the own cell is marked even when set_state erased it for this step
+    if(agents[a_id].cur_position != agents[a_id].goal)
+        input[radius * obs_size + radius + obs_size * obs_size] = 1;
+    // As in training, the path is followed until it leaves the full observation window (cfg.obs_radius) and only then
+    // cropped to the network window, so a path that leaves the network window and comes back is drawn in both parts.
+    for(auto& node : path)
     {
-        auto cur_pos = path.begin();
-        while(cur_pos != path.end() && std::abs(cur_pos->first - agents[a_id].cur_position.first) <= radius && std::abs(cur_pos->second - agents[a_id].cur_position.second) <= radius)
-        {
-            input[obs_size * (radius + cur_pos->first - agents[a_id].cur_position.first) + radius + cur_pos->second - agents[a_id].cur_position.second] = 1;
-            cur_pos++;
-        }
+        int di = node.first - agents[a_id].cur_position.first, dj = node.second - agents[a_id].cur_position.second;
+        if(std::abs(di) > cfg.obs_radius || std::abs(dj) > cfg.obs_radius)
+            break;
+        if(std::abs(di) <= radius && std::abs(dj) <= radius)
+            input[obs_size * (radius + di) + radius + dj] = 1;
     }
     return input;
 }
 
-int Follower::get_action(size_t agent_idx, std::pair<int, int> cur_position, std::pair<int, int> cur_goal)
+// Network input of one agent, 2 x (2r+1) x (2r+1): obstacles (-1) and the re-planned A* path (+1), other agents.
+std::vector<float> Follower::observe(size_t agent_idx, int radius)
 {
     std::list<std::pair<int, int>> occupied_cells = get_occupied_cells(agent_idx);
     planners[agent_idx].update_occupied_cells(occupied_cells, agents[agent_idx].goal);
     planners[agent_idx].update_path(agents[agent_idx].cur_position, agents[agent_idx].goal);
-    std::list<std::pair<int, int>> path = planners[agent_idx].get_path();
-    auto input = generate_input(agent_idx, actor.obs_radius, path);
+    return generate_input(agent_idx, radius, planners[agent_idx].get_path());
+}
+
+int Follower::get_action(size_t agent_idx, std::pair<int, int> cur_position, std::pair<int, int> cur_goal)
+{
+    auto input = observe(agent_idx, actor.obs_radius);
     auto result = actor.get_output({input, {0}});
     std::vector<int> score;
     score.reserve(result.first.size());
@@ -58,10 +64,10 @@ int Follower::get_action(size_t agent_idx, std::pair<int, int> cur_position, std
     return action;
 }
 
-std::vector<int> Follower::act(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals)
+void Follower::set_state(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals)
 {
-    std::vector<int> actions(agents.size(), 0);
-
+    // Cleared and set one agent at a time, in index order, like pogema's soft collision system: an agent that moved
+    // into the cell a later agent just left is erased for one step, and training saw the same agents grid.
     for(size_t agent_idx = 0; agent_idx < agents.size(); agent_idx++)
     {
         agents_pos[agents[agent_idx].cur_position.first][agents[agent_idx].cur_position.second] = 0;
@@ -71,6 +77,12 @@ std::vector<int> Follower::act(std::vector<std::pair<int, int>> cur_positions, s
         agents[agent_idx].goal = {goals[agent_idx].first + agents[agent_idx].offset.first,
                                   goals[agent_idx].second + agents[agent_idx].offset.second};
     }
+}
+
+std::vector<int> Follower::act(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals)
+{
+    std::vector<int> actions(agents.size(), 0);
+    set_state(cur_positions, goals);
     if(cfg.num_threads == 1)
     {
         for(size_t agent_idx = 0; agent_idx < agents.size(); agent_idx++)
@@ -90,7 +102,8 @@ void Follower::init(const Config& cfg_, py::array_t<double> array, std::vector<s
 {
     cfg = cfg_;
     pool.reset(cfg.num_threads);
-    actor = NN_module(cfg.path_to_weights);
+    if(!cfg.path_to_weights.empty())  // empty: observation-only use (tests), act() is unavailable
+        actor = NN_module(cfg.path_to_weights);
 
     py::buffer_info buf = array.request();
     double *ptr = (double *) buf.ptr;
@@ -120,6 +133,8 @@ py::class_<Follower>(m, "Follower")
 .def(py::init<>())
 .def("act", &Follower::act)
 .def("init", &Follower::init)
+.def("set_state", &Follower::set_state)
+.def("observe", &Follower::observe)
 ;
 }
 
