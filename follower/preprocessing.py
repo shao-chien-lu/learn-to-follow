@@ -9,6 +9,12 @@ from follower.planning import BatchPlanner, PlannerConfig
 class PreprocessorConfig(PlannerConfig):
     network_input_radius: int = 5
     intrinsic_target_reward: float = 0.01
+    # add the agent's short-term memory of its own motion as two input channels, see MemoryWrapper
+    use_memory: bool = False
+
+
+# number of past steps the memory channels cover; follower_cpp/follower.cpp uses the same value
+MEMORY_STEPS = 8
 
 
 def follower_preprocessor(env, algo_config):
@@ -18,6 +24,8 @@ def follower_preprocessor(env, algo_config):
 
 def wrap_preprocessors(env, config: PreprocessorConfig, auto_reset=False):
     env = FollowerWrapper(env=env, config=config)
+    if config.use_memory:
+        env = MemoryWrapper(env)
     env = CutObservationWrapper(env, target_observation_radius=config.network_input_radius)
     env = ConcatPositionalFeatures(env)
     if auto_reset:
@@ -58,6 +66,60 @@ class FollowerWrapper(ObservationWrapper):
         observations, infos = self.env.reset(**kwargs)
         self.reset_state()
         return self.observation(observations), infos
+
+
+class MemoryWrapper(gymnasium.Wrapper):
+    """
+    Short-term memory of each agent's own motion, as two extra channels in the full observation window (cropped and
+    stacked after 'obstacles' and 'agents' like them):
+      'blocked': if the agent did not move on the last step, the cell its last action aimed at (its own cell for
+                 'stay'), valued min(steps without moving, MEMORY_STEPS) / MEMORY_STEPS;
+      'trail':   its positions of the last MEMORY_STEPS steps, valued (MEMORY_STEPS + 1 - age) / MEMORY_STEPS, the most
+                 recent one where they coincide.
+    follower_cpp/follower.cpp builds the same channels at inference.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        d = self.env.observation_space['obstacles'].shape[0]
+        self.observation_space = Dict({**self.env.observation_space.spaces,
+                                       'blocked': Box(0.0, 1.0, shape=(d, d)), 'trail': Box(0.0, 1.0, shape=(d, d))})
+        self._moves = self.env.grid_config.MOVES
+        self._last_xy, self._last_actions, self._trails, self._stuck = None, None, None, None
+
+    def reset(self, **kwargs):
+        observations, infos = self.env.reset(**kwargs)
+        self._last_xy = [tuple(o['xy']) for o in observations]
+        self._last_actions = [None] * len(observations)
+        self._trails = [[] for _ in observations]  # previous positions, most recent first
+        self._stuck = [0] * len(observations)
+        return self._add_channels(observations), infos
+
+    def step(self, action):
+        self._last_actions = list(action)  # copy: pogema's soft collisions overwrite blocked moves with 'stay' in place
+        observations, reward, terminated, truncated, infos = self.env.step(action)
+        for k, obs in enumerate(observations):
+            xy = tuple(obs['xy'])
+            self._stuck[k] = self._stuck[k] + 1 if xy == self._last_xy[k] else 0
+            self._trails[k] = [self._last_xy[k]] + self._trails[k][:MEMORY_STEPS - 1]
+            self._last_xy[k] = xy
+        return self._add_channels(observations), reward, terminated, truncated, infos
+
+    def _add_channels(self, observations):
+        r = self.observation_space['blocked'].shape[0] // 2
+        for k, obs in enumerate(observations):
+            x, y = self._last_xy[k]
+            blocked = np.zeros((2 * r + 1, 2 * r + 1), dtype=np.float32)
+            if self._stuck[k]:
+                dx, dy = self._moves[self._last_actions[k]]
+                blocked[r + dx, r + dy] = min(self._stuck[k], MEMORY_STEPS) / MEMORY_STEPS
+            trail = np.zeros_like(blocked)
+            for age in range(len(self._trails[k]), 0, -1):  # oldest first, so the most recent one wins
+                px, py = self._trails[k][age - 1]
+                if abs(px - x) <= r and abs(py - y) <= r:
+                    trail[r + px - x, r + py - y] = (MEMORY_STEPS + 1 - age) / MEMORY_STEPS
+            obs['blocked'], obs['trail'] = blocked, trail
+        return observations
 
 
 class CutObservationWrapper(ObservationWrapper):

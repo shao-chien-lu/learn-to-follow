@@ -14,5 +14,6 @@ public:
     int obs_radius = 5;
     int num_threads = 8;
     int seed = 42;
+    bool use_memory = false;  // two short-term memory input channels, see follower.cpp
     std::string path_to_weights = "";
 };

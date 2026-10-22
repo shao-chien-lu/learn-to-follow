@@ -1,6 +1,11 @@
 // cppimport
 #include "follower.h"
 
+// number of past steps the memory channels cover, as MEMORY_STEPS in follower/preprocessing.py
+static const int MEMORY_STEPS = 8;
+// pogema's action order: stay, up, down, left, right as (di, dj)
+static const int MOVES[5][2] = {{0, 0}, {-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+
 // Read from agents_pos rather than the agent list, so that the occupation costs see the same agents as training does
 // (the pogema agents window, see set_state).
 std::list<std::pair<int, int>> Follower::get_occupied_cells(int agent_idx)
@@ -17,7 +22,7 @@ std::list<std::pair<int, int>> Follower::get_occupied_cells(int agent_idx)
 std::vector<float> Follower::generate_input(int a_id, int radius, std::list<std::pair<int, int>> path)
 {
     int obs_size = radius * 2 + 1;
-    std::vector<float> input(obs_size*obs_size*2, 0);
+    std::vector<float> input(obs_size*obs_size*(cfg.use_memory ? 4 : 2), 0);
     for(int i = -radius; i <= radius; i++)
         for(int j = -radius; j <= radius; j++)
         {
@@ -39,10 +44,30 @@ std::vector<float> Follower::generate_input(int a_id, int radius, std::list<std:
         if(std::abs(di) <= radius && std::abs(dj) <= radius)
             input[obs_size * (radius + di) + radius + dj] = 1;
     }
+    // memory channels, as MemoryWrapper: 'blocked' (the cell the last action aimed at, while not moving), 'trail'
+    if(cfg.use_memory)
+    {
+        float* blocked = input.data() + 2 * obs_size * obs_size;
+        float* trail = blocked + obs_size * obs_size;
+        if(stuck[a_id] > 0)
+        {
+            const int* move = MOVES[last_actions[a_id]];
+            blocked[(radius + move[0]) * obs_size + radius + move[1]] =
+                static_cast<float>(std::min(stuck[a_id], MEMORY_STEPS)) / MEMORY_STEPS;
+        }
+        int age = trails[a_id].size();
+        for(auto it = trails[a_id].rbegin(); it != trails[a_id].rend(); ++it, --age)  // oldest first: the most recent wins
+        {
+            int di = it->first - agents[a_id].cur_position.first, dj = it->second - agents[a_id].cur_position.second;
+            if(std::abs(di) <= radius && std::abs(dj) <= radius)
+                trail[(radius + di) * obs_size + radius + dj] = static_cast<float>(MEMORY_STEPS + 1 - age) / MEMORY_STEPS;
+        }
+    }
     return input;
 }
 
-// Network input of one agent, 2 x (2r+1) x (2r+1): obstacles (-1) and the re-planned A* path (+1), other agents.
+// Network input of one agent, 2 (4 with cfg.use_memory) x (2r+1) x (2r+1): obstacles (-1) and the re-planned A* path
+// (+1), other agents, and the memory channels.
 std::vector<float> Follower::observe(size_t agent_idx, int radius)
 {
     std::list<std::pair<int, int>> occupied_cells = get_occupied_cells(agent_idx);
@@ -61,7 +86,14 @@ int Follower::get_action(size_t agent_idx, std::pair<int, int> cur_position, std
         score.push_back(static_cast<int>(v * 1e6));
     std::discrete_distribution<int> distr(score.begin(), score.end());
     int action = distr(generators[agent_idx]);
+    last_actions[agent_idx] = action;
     return action;
+}
+
+// The actions taken since the last set_state, for the memory channels (act() records its own; tests call this).
+void Follower::set_actions(std::vector<int> actions)
+{
+    last_actions = actions;
 }
 
 void Follower::set_state(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals)
@@ -70,10 +102,18 @@ void Follower::set_state(std::vector<std::pair<int, int>> cur_positions, std::ve
     // into the cell a later agent just left is erased for one step, and training saw the same agents grid.
     for(size_t agent_idx = 0; agent_idx < agents.size(); agent_idx++)
     {
+        auto prev_position = agents[agent_idx].cur_position;
         agents_pos[agents[agent_idx].cur_position.first][agents[agent_idx].cur_position.second] = 0;
         agents[agent_idx].cur_position = {cur_positions[agent_idx].first + agents[agent_idx].offset.first,
                                           cur_positions[agent_idx].second + agents[agent_idx].offset.second};
         agents_pos[agents[agent_idx].cur_position.first][agents[agent_idx].cur_position.second] = 1;
+        if(cfg.use_memory && last_actions[agent_idx] >= 0)  // no step was taken before the first action
+        {
+            stuck[agent_idx] = agents[agent_idx].cur_position == prev_position ? stuck[agent_idx] + 1 : 0;
+            trails[agent_idx].push_front(prev_position);
+            if(trails[agent_idx].size() > MEMORY_STEPS)
+                trails[agent_idx].pop_back();
+        }
         agents[agent_idx].goal = {goals[agent_idx].first + agents[agent_idx].offset.first,
                                   goals[agent_idx].second + agents[agent_idx].offset.second};
     }
@@ -115,6 +155,9 @@ void Follower::init(const Config& cfg_, py::array_t<double> array, std::vector<s
 
     agents = std::vector<Agent>(abs_starts.size());
     generators = std::vector<std::mt19937>(agents.size());
+    trails = std::vector<std::deque<std::pair<int, int>>>(agents.size());
+    last_actions = std::vector<int>(agents.size(), -1);
+    stuck = std::vector<int>(agents.size(), 0);
     planners.clear();
     planner temp_planner(grid, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost);
     auto pen_matrix = temp_planner.precompute_penalty_matrix(cfg.obs_radius);
@@ -134,6 +177,7 @@ py::class_<Follower>(m, "Follower")
 .def("act", &Follower::act)
 .def("init", &Follower::init)
 .def("set_state", &Follower::set_state)
+.def("set_actions", &Follower::set_actions)
 .def("observe", &Follower::observe)
 ;
 }

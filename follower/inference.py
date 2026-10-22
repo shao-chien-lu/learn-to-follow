@@ -108,6 +108,7 @@ class FollowerInference:
         env = make_env_func_batched(config, env_config=AttrDict(worker_index=0, vector_index=0, env_id=0))
         actor_critic = create_actor_critic(config, env.observation_space, env.action_space)
         actor_critic.eval()
+        self.obs_shape = env.observation_space['obs'].shape
         env.close()
 
         if device != 'cpu' and not torch.cuda.is_available():
@@ -179,10 +180,8 @@ class FollowerInference:
 
     def to_onnx(self, filename='follower.onnx'):
         self.net.eval()
-        r = self.algo_cfg.training_config.preprocessing.network_input_radius
-        log.info(f"Saving model with network_input_radius = {r}")
-        d = 2 * r + 1
-        obs_example = torch.rand(1, 2, d, d, device=self.device)
+        log.info(f"Saving model with input shape {self.obs_shape}")
+        obs_example = torch.rand(1, *self.obs_shape, device=self.device)
         rnn_example = torch.rand(1, 1, device=self.device)
         with torch.no_grad():
             q = self.net({'obs': obs_example}, rnn_example)

@@ -10,6 +10,7 @@ py::class_<Config>(m, "Config")
     .def_readwrite("obs_radius", &Config::obs_radius)
     .def_readwrite("num_threads", &Config::num_threads)
     .def_readwrite("seed", &Config::seed)
+    .def_readwrite("use_memory", &Config::use_memory)
     .def_readwrite("path_to_weights", &Config::path_to_weights)
 ;
 }

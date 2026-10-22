@@ -58,6 +58,7 @@ class Experiment(BaseModel):
     recurrence: int = 8
     use_rnn: bool = False
     rnn_size: int = 256
+    actor_critic_share_weights: bool = True
 
     ppo_clip_ratio: float = 0.1
     batch_size: int = 2048
