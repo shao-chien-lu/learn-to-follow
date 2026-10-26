@@ -9,6 +9,7 @@ from sample_factory.algo.utils.misc import ExperimentStatus
 
 import wandb
 
+from follower.mlflow_logging import MlflowObserver, finish_training_run, start_training_run
 from follower.training_config import Experiment
 
 from sample_factory.utils.utils import log
@@ -65,6 +66,7 @@ def run(config=None):
 
     if exp.train_for_env_steps == 1_000_000:
         exp.use_wandb = False
+        exp.use_mlflow = False
 
     if exp.use_wandb:
         import os
@@ -75,8 +77,16 @@ def run(config=None):
 
     flat_config, runner = make_runner(create_sf_config(exp))
     register_msg_handlers(flat_config, runner)
-    status = runner.init()
-    if status == ExperimentStatus.SUCCESS:
-        status = runner.run()
+    run_id = start_training_run(exp, flat_config) if exp.use_mlflow else None
+    observer = MlflowObserver(run_id)
+    if run_id is not None:
+        runner.register_observer(observer)
+    status = ExperimentStatus.FAILURE
+    try:
+        status = runner.init()
+        if status == ExperimentStatus.SUCCESS:
+            status = runner.run()
+    finally:
+        finish_training_run(run_id, observer, runner, status)
 
     return status

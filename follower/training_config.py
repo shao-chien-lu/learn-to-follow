@@ -95,5 +95,7 @@ class Experiment(BaseModel):
     train_dir: str = 'experiments/train_dir'
     seed: Optional[int] = 42
     use_wandb: bool = True
+    use_mlflow: bool = True
+    mlflow_experiment: str = 'FollowerLite'
 
     env: Literal['PogemaMazes-v0'] = "PogemaMazes-v0"
