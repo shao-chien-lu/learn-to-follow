@@ -1,3 +1,10 @@
+from collections import deque
+
+try:
+    from typing import Literal
+except ImportError:
+    from typing_extensions import Literal
+
 import numpy as np
 import gymnasium
 from gymnasium import ObservationWrapper
@@ -11,6 +18,9 @@ class PreprocessorConfig(PlannerConfig):
     intrinsic_target_reward: float = 0.01
     # add the agent's short-term memory of its own motion as two input channels, see MemoryWrapper
     use_memory: bool = False
+    # add what the agent saw of the other agents on the last steps as input channels, see NeighbourMemoryWrapper:
+    # 'trail' (2 channels: their recent cells and how long each one has stayed)
+    neighbour_memory: Literal['none', 'trail'] = 'none'
 
 
 # number of past steps the memory channels cover; follower_cpp/follower.cpp uses the same value
@@ -26,6 +36,8 @@ def wrap_preprocessors(env, config: PreprocessorConfig, auto_reset=False):
     env = FollowerWrapper(env=env, config=config)
     if config.use_memory:
         env = MemoryWrapper(env)
+    if config.neighbour_memory != 'none':
+        env = NeighbourMemoryWrapper(env)
     env = CutObservationWrapper(env, target_observation_radius=config.network_input_radius)
     env = ConcatPositionalFeatures(env)
     if auto_reset:
@@ -122,6 +134,71 @@ class MemoryWrapper(gymnasium.Wrapper):
         return observations
 
 
+class NeighbourMemoryWrapper(gymnasium.Wrapper):
+    """
+    Memory of the other agents, from the agent's own past 'agents' channels only (each one as seen from where the agent
+    was then, without its own cell), moved into the current window. A cell counts as seen occupied a steps ago only if
+    it was in the agent's window then. Two channels, in the full observation window (cropped and stacked last):
+      'nb_trail': cells seen occupied on the last MEMORY_STEPS steps, valued (MEMORY_STEPS + 1 - age) / MEMORY_STEPS,
+                  the most recent one where they coincide;
+      'nb_wait':  for each currently occupied cell, the number of directly preceding steps it was seen occupied,
+                  / MEMORY_STEPS (0: someone just arrived there, 1: someone has stayed).
+    follower_cpp/follower.cpp builds the same channels at inference.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        d = self.env.observation_space['obstacles'].shape[0]
+        self.observation_space = Dict({**self.env.observation_space.spaces,
+                                       'nb_trail': Box(0.0, 1.0, shape=(d, d)), 'nb_wait': Box(0.0, 1.0, shape=(d, d))})
+        self._history = None  # (xy, seen) of the previous steps, most recent first
+        self._current = None
+
+    def reset(self, **kwargs):
+        observations, infos = self.env.reset(**kwargs)
+        self._history = deque(maxlen=MEMORY_STEPS)
+        self._current = self._snapshot(observations)
+        return self._add_channels(observations), infos
+
+    def step(self, action):
+        observations, reward, terminated, truncated, infos = self.env.step(action)
+        self._history.appendleft(self._current)
+        self._current = self._snapshot(observations)
+        return self._add_channels(observations), reward, terminated, truncated, infos
+
+    @staticmethod
+    def _snapshot(observations):
+        # xy is relative to each agent's own start, which is all that is needed to move its own past windows
+        xy = np.array([o['xy'] for o in observations], dtype=np.int64)
+        seen = np.array([o['agents'] for o in observations]) > 0
+        r = seen.shape[1] // 2
+        seen[:, r, r] = False
+        return xy, seen
+
+    def _add_channels(self, observations):
+        xy, now = self._current
+        n, d = now.shape[0], now.shape[1]
+        idx = np.arange(d)
+        agent = np.arange(n)[:, None, None]
+        past = []  # per age 1, 2, ...: (n, d, d) cells of the current window seen occupied then
+        for prev_xy, prev_seen in self._history:
+            # current cell i (offset i - r) is cell i + xy - prev_xy of the window back then
+            si = idx[None, :, None] + (xy[:, 0] - prev_xy[:, 0])[:, None, None]
+            sj = idx[None, None, :] + (xy[:, 1] - prev_xy[:, 1])[:, None, None]
+            inside = (si >= 0) & (si < d) & (sj >= 0) & (sj < d)
+            past.append(prev_seen[agent, si.clip(0, d - 1), sj.clip(0, d - 1)] & inside)
+        trail = np.zeros((n, d, d), dtype=np.float32)
+        for age in range(len(past), 0, -1):  # oldest first, so the most recent one wins
+            trail[past[age - 1]] = (MEMORY_STEPS + 1 - age) / MEMORY_STEPS
+        staying, steps = now.copy(), np.zeros((n, d, d), dtype=np.float32)
+        for seen in past:
+            staying &= seen
+            steps += staying
+        for k, obs in enumerate(observations):
+            obs['nb_trail'], obs['nb_wait'] = trail[k], steps[k] / MEMORY_STEPS
+        return observations
+
+
 class CutObservationWrapper(ObservationWrapper):
     def __init__(self, env, target_observation_radius):
         super().__init__(env)
@@ -184,6 +261,8 @@ class ConcatPositionalFeatures(ObservationWrapper):
             return '0_' + x
         elif 'agents' in x:
             return '1_' + x
+        elif x.startswith('nb_'):  # NeighbourMemoryWrapper's channels go after the own memory
+            return '3_' + x
         return '2_' + x
 
 

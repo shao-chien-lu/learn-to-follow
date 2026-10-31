@@ -19,10 +19,20 @@ std::list<std::pair<int, int>> Follower::get_occupied_cells(int agent_idx)
     return result;
 }
 
+// Whether agent a_id saw another agent on the absolute cell (i, j) `age` steps ago (1: the last step): the cell was in
+// its observation window then, and not its own cell.
+bool Follower::seen_occupied(size_t age, int a_id, int i, int j) const
+{
+    const auto& pos = position_history[age - 1][a_id];
+    return std::abs(i - pos.first) <= cfg.obs_radius && std::abs(j - pos.second) <= cfg.obs_radius &&
+           std::make_pair(i, j) != pos && agents_pos_history[age - 1][i][j];
+}
+
 std::vector<float> Follower::generate_input(int a_id, int radius, std::list<std::pair<int, int>> path)
 {
     int obs_size = radius * 2 + 1;
-    std::vector<float> input(obs_size*obs_size*(cfg.use_memory ? 4 : 2), 0);
+    int num_neighbour_channels = cfg.neighbour_memory == "trail" ? 2 : 0;
+    std::vector<float> input(obs_size*obs_size*((cfg.use_memory ? 4 : 2) + num_neighbour_channels), 0);
     for(int i = -radius; i <= radius; i++)
         for(int j = -radius; j <= radius; j++)
         {
@@ -63,6 +73,32 @@ std::vector<float> Follower::generate_input(int a_id, int radius, std::list<std:
                 trail[(radius + di) * obs_size + radius + dj] = static_cast<float>(MEMORY_STEPS + 1 - age) / MEMORY_STEPS;
         }
     }
+    // memory of the other agents, as NeighbourMemoryWrapper, after the own memory: nb_trail (the most recent step the
+    // cell was seen occupied), nb_wait (the steps directly before this one it was, if it is occupied now)
+    if(num_neighbour_channels)
+    {
+        float* nb_trail = input.data() + (cfg.use_memory ? 4 : 2) * obs_size * obs_size;
+        float* nb_wait = nb_trail + obs_size * obs_size;
+        const auto& cur = agents[a_id].cur_position;
+        for(int di = -radius; di <= radius; di++)
+            for(int dj = -radius; dj <= radius; dj++)
+            {
+                int i = cur.first + di, j = cur.second + dj, cell = (radius + di) * obs_size + radius + dj;
+                for(size_t age = 1; age <= agents_pos_history.size(); age++)
+                    if(seen_occupied(age, a_id, i, j))
+                    {
+                        nb_trail[cell] = static_cast<float>(MEMORY_STEPS + 1 - age) / MEMORY_STEPS;
+                        break;
+                    }
+                if(agents_pos[i][j] && std::make_pair(i, j) != cur)
+                {
+                    size_t steps = 0;
+                    while(steps < agents_pos_history.size() && seen_occupied(steps + 1, a_id, i, j))
+                        steps++;
+                    nb_wait[cell] = static_cast<float>(steps) / MEMORY_STEPS;
+                }
+            }
+    }
     return input;
 }
 
@@ -98,6 +134,20 @@ void Follower::set_actions(std::vector<int> actions)
 
 void Follower::set_state(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals)
 {
+    if(cfg.neighbour_memory != "none" && has_state)  // the state of the previous step becomes history
+    {
+        std::vector<std::pair<int, int>> positions;
+        for(const auto& agent : agents)
+            positions.push_back(agent.cur_position);
+        position_history.push_front(positions);
+        agents_pos_history.push_front(agents_pos);
+        if(position_history.size() > MEMORY_STEPS)
+        {
+            position_history.pop_back();
+            agents_pos_history.pop_back();
+        }
+    }
+    has_state = true;
     // Cleared and set one agent at a time, in index order, like pogema's soft collision system: an agent that moved
     // into the cell a later agent just left is erased for one step, and training saw the same agents grid.
     for(size_t agent_idx = 0; agent_idx < agents.size(); agent_idx++)
@@ -158,6 +208,9 @@ void Follower::init(const Config& cfg_, py::array_t<double> array, std::vector<s
     trails = std::vector<std::deque<std::pair<int, int>>>(agents.size());
     last_actions = std::vector<int>(agents.size(), -1);
     stuck = std::vector<int>(agents.size(), 0);
+    agents_pos_history.clear();
+    position_history.clear();
+    has_state = false;
     planners.clear();
     planner temp_planner(grid, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost);
     auto pen_matrix = temp_planner.precompute_penalty_matrix(cfg.obs_radius);

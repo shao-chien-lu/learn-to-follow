@@ -11,10 +11,12 @@ py::class_<Config>(m, "Config")
     .def_readwrite("num_threads", &Config::num_threads)
     .def_readwrite("seed", &Config::seed)
     .def_readwrite("use_memory", &Config::use_memory)
+    .def_readwrite("neighbour_memory", &Config::neighbour_memory)
     .def_readwrite("path_to_weights", &Config::path_to_weights)
 ;
 }
 <%
 cfg['extra_compile_args'] = ['-std=c++17']
+cfg['dependencies'] = ['config.h']
 setup_pybind11(cfg)
 %>

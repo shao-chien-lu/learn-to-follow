@@ -25,20 +25,22 @@ def _cpp_follower():
     return Follower, Config
 
 
-@pytest.mark.parametrize('use_memory', [False, True])
+@pytest.mark.parametrize('use_memory, neighbour_memory, radius', [
+    (False, 'none', 3), (True, 'none', 3), (True, 'trail', 3), (False, 'trail', 5)])
 @pytest.mark.parametrize('map_name', [r'mazes-.+', r'wfi_warehouse', r'pico_.+'])
-def test_training_obs_equal_cpp_inference_obs(map_name, use_memory):
+def test_training_obs_equal_cpp_inference_obs(map_name, use_memory, neighbour_memory, radius):
     Follower, Config = _cpp_follower()
-    n, radius = 24, 3
+    n = 24
     env_cfg = EnvironmentMazes()
     env_cfg.grid_config.num_agents = n
     env_cfg.grid_config.map_name = map_name
     env_cfg.grid_config.max_episode_steps = 50
     env_cfg.grid_config.seed = 5
-    env = wrap_preprocessors(create_env_base(env_cfg), PreprocessorConfig(network_input_radius=radius,
-                                                                          use_memory=use_memory))
+    env = wrap_preprocessors(create_env_base(env_cfg), PreprocessorConfig(
+        network_input_radius=radius, use_memory=use_memory, neighbour_memory=neighbour_memory))
     rng = np.random.default_rng(1)
     num_blocked = 0
+    num_waiting = 0  # cells with an agent that has stayed there (nb_wait > 0)
     for episode in range(2):
         obs, _ = env.reset(seed=episode)
         cfg = Config()
@@ -46,6 +48,7 @@ def test_training_obs_equal_cpp_inference_obs(map_name, use_memory):
         cfg.num_threads = 1
         cfg.path_to_weights = ''
         cfg.use_memory = use_memory
+        cfg.neighbour_memory = neighbour_memory
         algo = Follower()
         algo.init(cfg, np.array(env.get_global_obstacles(), dtype=np.float64), env.get_global_agents_xy())
         prev_xy, actions = None, None
@@ -56,6 +59,8 @@ def test_training_obs_equal_cpp_inference_obs(map_name, use_memory):
                 np.testing.assert_array_equal(cpp, o['obs'].ravel(), err_msg=f'episode {episode} step {step} agent {k}')
                 if use_memory and prev_xy is not None:
                     num_blocked += _check_memory_channels(o, prev_xy[k], actions[k], radius)
+                if neighbour_memory == 'trail':
+                    num_waiting += np.count_nonzero(o['obs'][-1])
             prev_xy = [tuple(o['xy']) for o in obs]
             actions = rng.integers(0, 5, size=n).tolist()
             algo.set_actions(actions)
@@ -64,6 +69,8 @@ def test_training_obs_equal_cpp_inference_obs(map_name, use_memory):
                 break
     if use_memory:
         assert num_blocked > 0, 'no agent was ever blocked, the memory channels were not exercised'
+    if neighbour_memory == 'trail':
+        assert num_waiting > 0, 'no agent ever stayed in view, nb_wait was not exercised'
 
 
 def _check_memory_channels(o, prev_xy, action, radius):

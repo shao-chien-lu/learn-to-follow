@@ -27,8 +27,14 @@ class Follower {
     std::vector<std::deque<std::pair<int, int>>> trails;  // previous positions, most recent first
     std::vector<int> last_actions;  // -1 before the first action
     std::vector<int> stuck;  // steps without moving
+    // memory of the other agents (cfg.neighbour_memory), as NeighbourMemoryWrapper: agents_pos and every agent's
+    // position on the previous steps, most recent first
+    std::deque<std::vector<std::vector<int>>> agents_pos_history;
+    std::deque<std::vector<std::pair<int, int>>> position_history;
+    bool has_state = false;  // set_state was called since init
 
     std::list<std::pair<int, int>> get_occupied_cells(int agent_idx);
+    bool seen_occupied(size_t age, int a_id, int i, int j) const;
     std::vector<float> generate_input(int a_id, int radius, std::list<std::pair<int, int>> path);
     int get_action(size_t agent_idx, std::pair<int, int> cur_position, std::pair<int, int> cur_goal);
 
