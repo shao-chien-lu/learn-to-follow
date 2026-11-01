@@ -10,6 +10,7 @@ import gymnasium
 from gymnasium import ObservationWrapper
 from gymnasium.spaces import Box, Dict
 
+import follower.pogema_fix  # noqa: F401  (patches pogema when LTF_FIX_SOFT_POSITIONS=1)
 from follower.planning import BatchPlanner, PlannerConfig
 
 

@@ -1,10 +1,18 @@
 // cppimport
 #include "follower.h"
+#include <cstdlib>
+#include <string>
 
 // number of past steps the memory channels cover, as MEMORY_STEPS in follower/preprocessing.py
 static const int MEMORY_STEPS = 8;
 // pogema's action order: stay, up, down, left, right as (di, dj)
 static const int MOVES[5][2] = {{0, 0}, {-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+// LTF_FIX_SOFT_POSITIONS=1: set_state clears every agent's old cell before marking the new ones, so no agent is erased,
+// matching follower/pogema_fix.py on the training side
+static const bool FIX_SOFT_POSITIONS = [] {
+    const char* value = std::getenv("LTF_FIX_SOFT_POSITIONS");
+    return value != nullptr && std::string(value) == "1";
+}();
 
 // Read from agents_pos rather than the agent list, so that the occupation costs see the same agents as training does
 // (the pogema agents window, see set_state).
@@ -149,11 +157,16 @@ void Follower::set_state(std::vector<std::pair<int, int>> cur_positions, std::ve
     }
     has_state = true;
     // Cleared and set one agent at a time, in index order, like pogema's soft collision system: an agent that moved
-    // into the cell a later agent just left is erased for one step, and training saw the same agents grid.
+    // into the cell a later agent just left is erased for one step, and training saw the same agents grid. With
+    // FIX_SOFT_POSITIONS all old cells are cleared first instead.
+    if(FIX_SOFT_POSITIONS)
+        for(const auto& agent : agents)
+            agents_pos[agent.cur_position.first][agent.cur_position.second] = 0;
     for(size_t agent_idx = 0; agent_idx < agents.size(); agent_idx++)
     {
         auto prev_position = agents[agent_idx].cur_position;
-        agents_pos[agents[agent_idx].cur_position.first][agents[agent_idx].cur_position.second] = 0;
+        if(!FIX_SOFT_POSITIONS)
+            agents_pos[agents[agent_idx].cur_position.first][agents[agent_idx].cur_position.second] = 0;
         agents[agent_idx].cur_position = {cur_positions[agent_idx].first + agents[agent_idx].offset.first,
                                           cur_positions[agent_idx].second + agents[agent_idx].offset.second};
         agents_pos[agents[agent_idx].cur_position.first][agents[agent_idx].cur_position.second] = 1;

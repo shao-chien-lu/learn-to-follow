@@ -1,5 +1,6 @@
 import gymnasium
 
+import follower.pogema_fix  # noqa: F401  (patches pogema when LTF_FIX_SOFT_POSITIONS=1)
 
 class ProvideMapWrapper(gymnasium.Wrapper):
     def reset(self, **kwargs):
