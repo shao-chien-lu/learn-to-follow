@@ -5,6 +5,7 @@ from utils import fix_num_threads_issue
 
 import multiprocessing
 from pathlib import Path
+from typing import Optional
 
 from sample_factory.utils.utils import log
 
@@ -22,6 +23,9 @@ class FollowerConfigCPP(FollowerInferenceConfig, extra=Extra.forbid):
     num_threads: int = 8
     path_to_weights: str = "model/follower-lite/"
     preprocessing: PreprocessorConfig = PreprocessorConfig()
+    # eval-time crisscross highways of the planner (None: the model's training setting)
+    crisscross_ratio: Optional[float] = None
+    crisscross_all: Optional[bool] = None
 
 
 class FollowerInferenceCPP:
@@ -45,6 +49,9 @@ class FollowerInferenceCPP:
         self.cpp_config.use_static_cost = self.cfg.training_config.preprocessing.use_static_cost
         self.cpp_config.use_dynamic_cost = self.cfg.training_config.preprocessing.use_dynamic_cost
         self.cpp_config.reset_dynamic_cost = self.cfg.training_config.preprocessing.reset_dynamic_cost
+        for key in ['crisscross_ratio', 'crisscross_all']:
+            value = getattr(self.cfg, key)
+            setattr(self.cpp_config, key, getattr(self.cfg.training_config.preprocessing, key) if value is None else value)
         self.cpp_config.seed = self.cfg.seed
         self.cpp_config.use_memory = self.cfg.training_config.preprocessing.use_memory
         self.cpp_config.neighbour_memory = self.cfg.training_config.preprocessing.neighbour_memory

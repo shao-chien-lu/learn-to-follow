@@ -18,6 +18,10 @@ class PlannerConfig(BaseModel):
     use_static_cost: bool = True
     use_dynamic_cost: bool = True
     reset_dynamic_cost: bool = True
+    # soft crisscross highways: moves against them cost crisscross_ratio times as much (1: off); with crisscross_all
+    # the factor also scales the dynamic cost; see planner.h
+    crisscross_ratio: float = 1.0
+    crisscross_all: bool = False
 
 
 # Static penalties depend only on the map and obs radius; training cycles over a fixed set of maps,
@@ -55,6 +59,7 @@ class Planner:
             self.planner = [planner(self.obstacles, self.cfg.use_static_cost, self.cfg.use_dynamic_cost, self.cfg.reset_dynamic_cost) for _ in range(num_agents)]
             for i, p in enumerate(self.planner):
                 p.set_abs_start(self.starts[i])
+                p.set_crisscross(self.cfg.crisscross_ratio, self.cfg.crisscross_all)
             if self.cfg.use_static_cost:
                 penalties = get_penalties(self.obstacles, obs_radius, self.cfg)
                 for p in self.planner:
@@ -99,6 +104,7 @@ class BatchPlanner:
             cfg = self.cfg
             self.planner = multi_planner(self.obstacles, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost,
                                          [tuple(s) for s in self.starts], self.intrinsic_target_reward)
+            self.planner.set_crisscross(cfg.crisscross_ratio, cfg.crisscross_all)
             if cfg.use_static_cost:
                 obs_radius = len(observations[0]['obstacles']) // 2
                 self.planner.set_penalties(np.asarray(get_penalties(self.obstacles, obs_radius, cfg), dtype=np.float32))

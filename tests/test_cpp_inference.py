@@ -25,10 +25,15 @@ def _cpp_follower():
     return Follower, Config
 
 
-@pytest.mark.parametrize('use_memory, neighbour_memory, radius', [
-    (False, 'none', 3), (True, 'none', 3), (True, 'trail', 3), (False, 'trail', 5)])
+CC_OFF = {'crisscross_ratio': 1.0, 'crisscross_all': False}
+
+
+@pytest.mark.parametrize('use_memory, neighbour_memory, radius, cc', [
+    (False, 'none', 3, CC_OFF), (True, 'none', 3, CC_OFF), (True, 'trail', 3, CC_OFF), (False, 'trail', 5, CC_OFF),
+    (True, 'none', 3, {'crisscross_ratio': 3.0, 'crisscross_all': False}),
+    (True, 'trail', 3, {'crisscross_ratio': 1.5, 'crisscross_all': True})], ids=str)
 @pytest.mark.parametrize('map_name', [r'mazes-.+', r'wfi_warehouse', r'pico_.+'])
-def test_training_obs_equal_cpp_inference_obs(map_name, use_memory, neighbour_memory, radius):
+def test_training_obs_equal_cpp_inference_obs(map_name, use_memory, neighbour_memory, radius, cc):
     Follower, Config = _cpp_follower()
     n = 24
     env_cfg = EnvironmentMazes()
@@ -37,7 +42,7 @@ def test_training_obs_equal_cpp_inference_obs(map_name, use_memory, neighbour_me
     env_cfg.grid_config.max_episode_steps = 50
     env_cfg.grid_config.seed = 5
     env = wrap_preprocessors(create_env_base(env_cfg), PreprocessorConfig(
-        network_input_radius=radius, use_memory=use_memory, neighbour_memory=neighbour_memory))
+        network_input_radius=radius, use_memory=use_memory, neighbour_memory=neighbour_memory, **cc))
     rng = np.random.default_rng(1)
     num_blocked = 0
     num_waiting = 0  # cells with an agent that has stayed there (nb_wait > 0)
@@ -49,6 +54,8 @@ def test_training_obs_equal_cpp_inference_obs(map_name, use_memory, neighbour_me
         cfg.path_to_weights = ''
         cfg.use_memory = use_memory
         cfg.neighbour_memory = neighbour_memory
+        for key, value in cc.items():
+            setattr(cfg, key, value)
         algo = Follower()
         algo.init(cfg, np.array(env.get_global_obstacles(), dtype=np.float64), env.get_global_agents_xy())
         prev_xy, actions = None, None

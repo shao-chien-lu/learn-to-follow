@@ -194,6 +194,106 @@ def test_path_is_valid_and_optimal(grid_name, flags):
         assert p.get_next_node() == (start, path[1])
 
 
+# ---------------------------------------------------------------- crisscross highways
+
+@pytest.mark.parametrize('flags', FLAGS, ids=lambda f: 'S%dD%dR%d' % tuple(map(int, f)))
+@pytest.mark.parametrize('cc_all', [False, True])
+def test_crisscross_ratio_one_matches_reference(flags, cc_all):
+    """Ratio 1 (off) keeps the planner bit-identical to the original."""
+    rng = np.random.default_rng(5)
+    grid = warehouse_like_grid(33, 46, 1)
+    cells = free_cells(grid)
+    new, ref = make_pair(grid, flags, (1, 2))
+    new.set_crisscross(1.0, cc_all)
+    rel = lambda c: (c[0] - 1, c[1] - 2)
+    goal = cells[0]
+    for step in range(60):
+        if step % 15 == 0:
+            goal = cells[rng.integers(len(cells))]
+        win, cur = occupation_window(rng, grid, (1, 2))
+        new.update_occupations(win, cur, rel(goal))
+        ref.update_occupations(win, cur, rel(goal))
+        start = cells[rng.integers(len(cells))]
+        new.update_path(rel(start), rel(goal))
+        ref.update_path(rel(start), rel(goal))
+        assert_same_outputs(new, ref)
+
+
+def against_crisscross(u, v):
+    """planner.h's highways in absolute coordinates: east on even rows, west on odd rows, south on even columns,
+    north on odd columns."""
+    di, dj = v[0] - u[0], v[1] - u[1]
+    if dj:
+        return u[0] % 2 == (1 if dj == 1 else 0)
+    return u[1] % 2 == (1 if di == 1 else 0)
+
+
+def directed_dijkstra_cost(grid, move_cost, start, goal):
+    dist = {start: 0.0}
+    pq = [(0.0, start)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist[u]:
+            continue
+        if u == goal:
+            return d
+        for di, dj in ((0, 1), (1, 0), (-1, 0), (0, -1)):
+            v = (u[0] + di, u[1] + dj)
+            if grid[v] == 0 and d + move_cost(u, v) < dist.get(v, np.inf):
+                dist[v] = d + move_cost(u, v)
+                heapq.heappush(pq, (dist[v], v))
+    return np.inf
+
+
+@pytest.mark.parametrize('ratio', [1.5, 3.0])
+@pytest.mark.parametrize('use_dynamic, cc_all', [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize('grid_name', ['random20_d10', 'maze31', 'warehouse'])
+def test_crisscross_against_oracle(grid_name, use_dynamic, cc_all, ratio):
+    """Directed move costs as defined in planner.h, with a non-zero abs_offset so that the highways must follow the
+    absolute grid coordinates; without static costs the heuristic is admissible, so paths must be optimal."""
+    rng = np.random.default_rng(13)
+    grid = GRIDS[grid_name](2)
+    cells = free_cells(grid)
+    offset = (3, 1)
+    rel = lambda c: (c[0] - offset[0], c[1] - offset[1])
+    num_checked = 0
+    for _ in range(40):
+        start, goal = cells[rng.integers(len(cells))], cells[rng.integers(len(cells))]
+        win, cur = occupation_window(rng, grid, offset)
+        occ = np.zeros(grid.shape)
+        ii, jj = np.nonzero(win)
+        occ[ii + cur[0] + offset[0], jj + cur[1] + offset[1]] += 1
+
+        p = new_planner(grid.tolist(), False, use_dynamic, True)
+        p.set_abs_start(offset)
+        p.set_crisscross(ratio, cc_all)
+        p.update_occupations(win, cur, rel(goal))
+        p.update_path(rel(start), rel(goal))
+        path = [(a + offset[0], b + offset[1]) for a, b in p.get_path()]
+
+        def move_cost(u, v):
+            factor = ratio if against_crisscross(u, v) else 1.0
+            dyn = occ[v] if use_dynamic else 0.0
+            return (1.0 + dyn) * factor if cc_all else factor + dyn
+
+        best = directed_dijkstra_cost(grid, move_cost, start, goal)
+        if start == goal or not np.isfinite(best):
+            assert path == []
+            continue
+        assert path[0] == start and path[-1] == goal
+        for a, b in zip(path, path[1:]):
+            assert abs(a[0] - b[0]) + abs(a[1] - b[1]) == 1 and grid[b] == 0
+        assert sum(move_cost(a, b) for a, b in zip(path, path[1:])) == pytest.approx(best, rel=1e-4)
+        num_checked += 1
+    assert num_checked > 30
+
+
+def test_crisscross_rejects_ratio_below_one():
+    p = new_planner(maze_grid(15, 0).tolist(), True, True, True)
+    with pytest.raises(ValueError):
+        p.set_crisscross(0.5, False)
+
+
 # ---------------------------------------------------------------- edge cases
 
 @pytest.mark.parametrize('make', [new_planner, ref_planner], ids=['new', 'ref'])

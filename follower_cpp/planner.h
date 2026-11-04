@@ -41,9 +41,24 @@ class planner
     bool use_static_cost;
     bool use_dynamic_cost;
     bool reset_dynamic_cost;
+    float crisscross_ratio = 1.f;          // cost factor of moves against the crisscross highways (1: off)
+    bool crisscross_all = false;           // the factor also scales the dynamic cost, not only the static one
     int d4[4];
 
     inline int id(int i, int j) const { return i * W + j; }
+
+    // Crisscross highways: horizontal moves are encouraged eastwards on even rows and westwards on odd rows, vertical
+    // moves southwards on even columns and northwards on odd columns (absolute grid coordinates). k indexes d4.
+    inline bool against_crisscross(int from, int k) const
+    {
+        int i = from / W, j = from % W;
+        switch(k) {
+            case 0: return i % 2 == 1;   // east
+            case 1: return j % 2 == 1;   // south
+            case 2: return j % 2 == 0;   // north
+            default: return i % 2 == 0;  // west
+        }
+    }
     inline float g_of(int n) const { return stamp_[n] == search_id ? g_[n] : (float)INF; }
 
     void push(std::vector<QNode>& h, QNode n) { h.push_back(n); std::push_heap(h.begin(), h.end(), std::greater<QNode>()); }
@@ -71,8 +86,14 @@ class planner
                 float cost(1);
                 if(use_static_cost)
                     cost = penalties[n];
+                // Only raises costs, so the heuristic (which ignores the highways) is no less admissible than before.
+                bool against = crisscross_ratio != 1.f and against_crisscross(cur.idx, k);
+                if(against and not crisscross_all)
+                    cost *= crisscross_ratio;
                 if(use_dynamic_cost)
                     cost += num_occupations[n];
+                if(against and crisscross_all)
+                    cost *= crisscross_ratio;
                 float ng = cur.g + cost;
                 if(g_of(n) > ng)
                 {
@@ -192,6 +213,15 @@ public:
                     pen[id(i, j)] = max_avg_dist / pen[id(i, j)];
         penalties = pen;
         return to_2d(pen);
+    }
+
+    // Soft crisscross highways (as SILLM's Static Guidance): moves against them cost `ratio` times as much.
+    void set_crisscross(float ratio, bool all)
+    {
+        if(!(ratio >= 1.f))
+            throw std::invalid_argument("crisscross ratio must be >= 1");
+        crisscross_ratio = ratio;
+        crisscross_all = all;
     }
 
     void set_penalties(std::vector<std::vector<float>> _penalties)
@@ -325,6 +355,12 @@ public:
             throw std::invalid_argument("penalties shape must match the grid");
         for(auto& p: ps)
             p.set_penalties_flat(pen.data());
+    }
+
+    void set_crisscross(float ratio, bool all)
+    {
+        for(auto& p: ps)
+            p.set_crisscross(ratio, all);
     }
 
     // agents / obstacles: float32 (N, R, R), modified in place (agents: own cell set to 1 for re-planned agents;

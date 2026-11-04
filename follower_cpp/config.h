@@ -11,6 +11,8 @@ public:
     bool use_static_cost = true;
     bool use_dynamic_cost = true;
     bool reset_dynamic_cost = true;
+    float crisscross_ratio = 1.f;  // soft crisscross highways, see planner::set_crisscross
+    bool crisscross_all = false;
     int obs_radius = 5;
     int num_threads = 8;
     int seed = 42;

@@ -233,6 +233,7 @@ void Follower::init(const Config& cfg_, py::array_t<double> array, std::vector<s
         agents_pos[abs_starts[agent_idx].first][abs_starts[agent_idx].second] = 1;
         planners.emplace_back(grid, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost);
         planners.back().set_penalties(pen_matrix);
+        planners.back().set_crisscross(cfg.crisscross_ratio, cfg.crisscross_all);
         generators[agent_idx].seed(cfg.seed);
     }
 }
