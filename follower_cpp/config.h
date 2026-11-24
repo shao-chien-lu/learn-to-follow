@@ -18,5 +18,6 @@ public:
     int seed = 42;
     bool use_memory = false;  // two short-term memory input channels, see follower.cpp
     std::string neighbour_memory = "none";  // memory of the other agents: "none" or "trail", see follower.cpp
+    std::string ablate_channels = "";  // comma-separated input channels fed as zeros, see Follower::init
     std::string path_to_weights = "";
 };

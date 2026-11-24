@@ -55,6 +55,7 @@ class FollowerInferenceCPP:
         self.cpp_config.seed = self.cfg.seed
         self.cpp_config.use_memory = self.cfg.training_config.preprocessing.use_memory
         self.cpp_config.neighbour_memory = self.cfg.training_config.preprocessing.neighbour_memory
+        self.cpp_config.ablate_channels = self.cfg.training_config.preprocessing.ablate_channels
 
         w_dir = Path(self.cfg.path_to_weights)
         self.cpp_config.path_to_weights = str(w_dir / str(w_dir.name + '.onnx'))

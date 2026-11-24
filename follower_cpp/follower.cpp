@@ -1,6 +1,9 @@
 // cppimport
 #include "follower.h"
+#include <algorithm>
 #include <cstdlib>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 
 // number of past steps the memory channels cover, as MEMORY_STEPS in follower/preprocessing.py
@@ -107,6 +110,9 @@ std::vector<float> Follower::generate_input(int a_id, int radius, std::list<std:
                 }
             }
     }
+    // channel ablation, as AblateChannelsWrapper
+    for(int channel : ablated_channels)
+        std::fill(input.begin() + channel * obs_size * obs_size, input.begin() + (channel + 1) * obs_size * obs_size, 0.f);
     return input;
 }
 
@@ -224,6 +230,21 @@ void Follower::init(const Config& cfg_, py::array_t<double> array, std::vector<s
     agents_pos_history.clear();
     position_history.clear();
     has_state = false;
+    // the input channels in network order (ConcatPositionalFeatures), for cfg.ablate_channels
+    std::vector<std::string> channels = {"obstacles", "agents"};
+    if(cfg.use_memory)
+        channels.insert(channels.end(), {"blocked", "trail"});
+    if(cfg.neighbour_memory == "trail")
+        channels.insert(channels.end(), {"nb_trail", "nb_wait"});
+    ablated_channels.clear();
+    std::stringstream names(cfg.ablate_channels);
+    for(std::string name; std::getline(names, name, ',');)
+    {
+        auto it = std::find(channels.begin(), channels.end(), name);
+        if(it == channels.end())
+            throw std::invalid_argument("ablate_channels: '" + name + "' is not an input channel of this configuration");
+        ablated_channels.push_back(static_cast<int>(it - channels.begin()));
+    }
     planners.clear();
     planner temp_planner(grid, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost);
     auto pen_matrix = temp_planner.precompute_penalty_matrix(cfg.obs_radius);

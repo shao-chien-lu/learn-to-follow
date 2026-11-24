@@ -80,6 +80,67 @@ def test_training_obs_equal_cpp_inference_obs(map_name, use_memory, neighbour_me
         assert num_waiting > 0, 'no agent ever stayed in view, nb_wait was not exercised'
 
 
+CHANNELS = ['obstacles', 'agents', 'blocked', 'trail', 'nb_trail', 'nb_wait']  # network order with memory + nb
+
+
+@pytest.mark.parametrize('ablate', ['blocked', 'trail', 'nb_trail', 'nb_wait', 'blocked,nb_wait'])
+def test_ablate_channels(ablate):
+    """ablate_channels zeroes exactly the named channels, in training (AblateChannelsWrapper) and in the C++ inference
+    alike, and leaves every other channel as without the ablation."""
+    Follower, Config = _cpp_follower()
+    n, radius = 24, 3
+    envs = []
+    for names in ['', ablate]:
+        env_cfg = EnvironmentMazes()
+        env_cfg.grid_config.num_agents = n
+        env_cfg.grid_config.max_episode_steps = 50
+        env_cfg.grid_config.seed = 5
+        envs.append(wrap_preprocessors(create_env_base(env_cfg), PreprocessorConfig(
+            network_input_radius=radius, use_memory=True, neighbour_memory='trail', ablate_channels=names)))
+    zeroed = [CHANNELS.index(name) for name in ablate.split(',')]
+    kept = [c for c in range(len(CHANNELS)) if c not in zeroed]
+    rng = np.random.default_rng(1)
+    full, obs = envs[0].reset(seed=0)[0], envs[1].reset(seed=0)[0]
+    cfg = Config()
+    cfg.obs_radius = envs[1].grid_config.obs_radius
+    cfg.num_threads = 1
+    cfg.path_to_weights = ''
+    cfg.use_memory = True
+    cfg.neighbour_memory = 'trail'
+    cfg.ablate_channels = ablate
+    algo = Follower()
+    algo.init(cfg, np.array(envs[1].get_global_obstacles(), dtype=np.float64), envs[1].get_global_agents_xy())
+    num_nonzero = 0  # entries the ablation removed
+    for step in range(30):
+        algo.set_state([tuple(o['xy']) for o in obs], [tuple(o['target_xy']) for o in obs])
+        for k, (f, o) in enumerate(zip(full, obs)):
+            assert o['obs'].shape == f['obs'].shape == (len(CHANNELS), 2 * radius + 1, 2 * radius + 1)
+            assert not o['obs'][zeroed].any()
+            np.testing.assert_array_equal(o['obs'][kept], f['obs'][kept])
+            num_nonzero += np.count_nonzero(f['obs'][zeroed])
+            cpp = np.array(algo.observe(k, radius), dtype=np.float32)
+            np.testing.assert_array_equal(cpp, o['obs'].ravel(), err_msg=f'step {step} agent {k}')
+        actions = rng.integers(0, 5, size=n).tolist()
+        algo.set_actions(actions)
+        full = envs[0].step(list(actions))[0]
+        obs = envs[1].step(list(actions))[0]
+    assert num_nonzero > 0, f'{ablate} was always zero anyway, the test does not exercise the ablation'
+
+
+def test_ablate_unknown_channel():
+    env_cfg = EnvironmentMazes()
+    env_cfg.grid_config.num_agents = 4
+    with pytest.raises(ValueError, match='nb_wait'):
+        wrap_preprocessors(create_env_base(env_cfg), PreprocessorConfig(use_memory=True, ablate_channels='nb_wait'))
+    Follower, Config = _cpp_follower()
+    cfg = Config()
+    cfg.path_to_weights = ''
+    cfg.use_memory = True
+    cfg.ablate_channels = 'nb_wait'
+    with pytest.raises(ValueError, match='nb_wait'):
+        Follower().init(cfg, np.zeros((16, 16)), [(5, 5)])
+
+
 def _check_memory_channels(o, prev_xy, action, radius):
     """The memory channels against their definition (MemoryWrapper) for the step prev_xy --action--> o['xy'].
     Returns 1 if the agent was blocked."""

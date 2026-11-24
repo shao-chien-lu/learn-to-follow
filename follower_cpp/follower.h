@@ -32,6 +32,7 @@ class Follower {
     std::deque<std::vector<std::vector<int>>> agents_pos_history;
     std::deque<std::vector<std::pair<int, int>>> position_history;
     bool has_state = false;  // set_state was called since init
+    std::vector<int> ablated_channels;  // indices of the input channels fed as zeros (cfg.ablate_channels)
 
     std::list<std::pair<int, int>> get_occupied_cells(int agent_idx);
     bool seen_occupied(size_t age, int a_id, int i, int j) const;

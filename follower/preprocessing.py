@@ -22,6 +22,9 @@ class PreprocessorConfig(PlannerConfig):
     # add what the agent saw of the other agents on the last steps as input channels, see NeighbourMemoryWrapper:
     # 'trail' (2 channels: their recent cells and how long each one has stayed)
     neighbour_memory: Literal['none', 'trail'] = 'none'
+    # channel ablation: comma-separated input channels fed to the network as zeros (e.g. 'blocked,nb_wait'), which is
+    # equivalent to removing them, see AblateChannelsWrapper
+    ablate_channels: str = ''
 
 
 # number of past steps the memory channels cover; follower_cpp/follower.cpp uses the same value
@@ -39,6 +42,8 @@ def wrap_preprocessors(env, config: PreprocessorConfig, auto_reset=False):
         env = MemoryWrapper(env)
     if config.neighbour_memory != 'none':
         env = NeighbourMemoryWrapper(env)
+    if config.ablate_channels:
+        env = AblateChannelsWrapper(env, config.ablate_channels.split(','))
     env = CutObservationWrapper(env, target_observation_radius=config.network_input_radius)
     env = ConcatPositionalFeatures(env)
     if auto_reset:
@@ -197,6 +202,30 @@ class NeighbourMemoryWrapper(gymnasium.Wrapper):
             steps += staying
         for k, obs in enumerate(observations):
             obs['nb_trail'], obs['nb_wait'] = trail[k], steps[k] / MEMORY_STEPS
+        return observations
+
+
+class AblateChannelsWrapper(ObservationWrapper):
+    """
+    Sets the given input channels (keys of the full observation window, e.g. 'blocked', 'trail', 'nb_trail',
+    'nb_wait') to zero. The network keeps its input shape; a channel that is always zero adds nothing to the first
+    convolution (zero padding included) and its weights get no gradient, so this equals removing the channel.
+    follower_cpp/follower.cpp zeroes the same channels at inference (Config.ablate_channels).
+    """
+
+    def __init__(self, env, names):
+        super().__init__(env)
+        d = self.env.observation_space['obstacles'].shape[0]
+        for name in names:
+            space = self.observation_space.spaces.get(name)
+            if space is None or space.shape != (d, d):
+                raise ValueError(f'ablate_channels: {name!r} is not an input channel of this configuration')
+        self._names = list(names)
+
+    def observation(self, observations):
+        for obs in observations:
+            for name in self._names:
+                obs[name] = np.zeros_like(obs[name], dtype=np.float32)
         return observations
 
 
