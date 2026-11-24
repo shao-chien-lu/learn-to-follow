@@ -33,6 +33,18 @@ class Follower {
     std::deque<std::vector<std::pair<int, int>>> position_history;
     bool has_state = false;  // set_state was called since init
     std::vector<int> ablated_channels;  // indices of the input channels fed as zeros (cfg.ablate_channels)
+    // density gate (cfg.guidance_gate): every agent's smoothed local density (-1: no step yet) and current gate
+    std::vector<float> rho_ema;
+    std::vector<float> gates;
+    float gate_alpha = 1.f;  // EMA weight of the new density (1: raw)
+    float update_gate(size_t agent_idx, size_t num_others);
+    // cfg.dflow != "off": agents_pos and every agent's position at the previous set_state, to infer the moves of the
+    // other agents each agent saw (see add_observed_flow)
+    bool dflow_on = false;
+    bool has_prev_state = false;
+    std::vector<std::vector<int>> prev_agents_pos;
+    std::vector<std::pair<int, int>> prev_positions;
+    void add_observed_flow(size_t agent_idx);
 
     std::list<std::pair<int, int>> get_occupied_cells(int agent_idx);
     bool seen_occupied(size_t age, int a_id, int i, int j) const;
@@ -45,6 +57,10 @@ public:
     void set_state(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals);
     void set_actions(std::vector<int> actions);
     std::vector<float> observe(size_t agent_idx, int radius);
+    std::vector<float> get_gates() const { return gates; }  // the agents' gates of their last observe (1 without gate)
+    // tests: the planner flow of one agent (H x W x 4, see planner::get_flow_matrix) and its occupation counts
+    std::vector<std::vector<std::vector<float>>> get_flow(size_t agent_idx) const { return planners[agent_idx].get_flow_matrix(); }
+    std::vector<std::vector<float>> get_occupations(size_t agent_idx) { return planners[agent_idx].get_num_occupied_matrix(); }
     std::vector<int> act(std::vector<std::pair<int, int>> cur_positions, std::vector<std::pair<int, int>> goals);
 };
 

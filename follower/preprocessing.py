@@ -31,8 +31,21 @@ class PreprocessorConfig(PlannerConfig):
 MEMORY_STEPS = 8
 
 
+# eval-time planner options of FollowerInferenceConfig, applied on top of the model's training preprocessing
+EVAL_PLANNER_KEYS = ['crisscross_ratio', 'crisscross_all', 'guidance_dir', 'guidance_gate_rho0', 'guidance_gate_rho1',
+                     'guidance_gate_halflife', 'dflow', 'dflow_with', 'dflow_opp']
+
+
 def follower_preprocessor(env, algo_config):
-    env = wrap_preprocessors(env, algo_config.training_config.preprocessing)
+    preprocessing = algo_config.training_config.preprocessing
+    defaults = PlannerConfig()
+    # only options set away from their "unchanged" value: None, or the PlannerConfig default for the non-optional ones
+    changes = {k: getattr(algo_config, k) for k in EVAL_PLANNER_KEYS
+               if getattr(algo_config, k, None) is not None and
+               (k in ('crisscross_ratio', 'crisscross_all') or getattr(algo_config, k) != getattr(defaults, k))}
+    if changes:
+        preprocessing = PreprocessorConfig(**{**preprocessing.dict(), **changes})
+    env = wrap_preprocessors(env, preprocessing)
     return env
 
 

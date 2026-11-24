@@ -1,3 +1,6 @@
+import os
+from typing import Optional
+
 import numpy as np
 from pogema import GridConfig
 
@@ -22,6 +25,24 @@ class PlannerConfig(BaseModel):
     # the factor also scales the dynamic cost; see planner.h
     crisscross_ratio: float = 1.0
     crisscross_all: bool = False
+    # Eval-only options of the C++ Follower's planner (follower_cpp/inference.py FollowerConfigCPP), here for the python
+    # path (BatchPlanner / multi_planner); the defaults keep the planner unchanged.
+    # guidance_dir: per-map tables <guidance_key(global obstacles, num_agents)>.npy (follower_cpp/guidance.py)
+    guidance_dir: Optional[str] = None
+    # density gate of the tables: clip((rho - rho0) / (rho1 - rho0), 0, 1), rho = other agents / free cells of the
+    # agent's own observation window, EMA with half-life guidance_gate_halflife (<= 0: raw)
+    guidance_gate_rho0: Optional[float] = None
+    guidance_gate_rho1: Optional[float] = None
+    guidance_gate_halflife: float = 4.0
+    # direction-aware dynamic cost from the observed flow of other agents (planner::set_dflow)
+    dflow: Literal['off', 'add', 'split', 'ggboost'] = 'off'
+    dflow_with: float = 1.0
+    dflow_opp: float = 1.0
+
+
+DFLOW_MODES = {'off': 0, 'add': 1, 'split': 2, 'ggboost': 3}
+# one line per distinct planner config and process, as evidence of the settings that reached the planner
+_CONFIGS_DUMPED = set()
 
 
 # Static penalties depend only on the map and obs radius; training cycles over a fixed set of maps,
@@ -105,6 +126,7 @@ class BatchPlanner:
             self.planner = multi_planner(self.obstacles, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost,
                                          [tuple(s) for s in self.starts], self.intrinsic_target_reward)
             self.planner.set_crisscross(cfg.crisscross_ratio, cfg.crisscross_all)
+            self._set_eval_options(cfg)
             if cfg.use_static_cost:
                 obs_radius = len(observations[0]['obstacles']) // 2
                 self.planner.set_penalties(np.asarray(get_penalties(self.obstacles, obs_radius, cfg), dtype=np.float32))
@@ -120,6 +142,30 @@ class BatchPlanner:
             obs['agents'] = agents[k]
             obs['obstacles'] = obstacles[k]
         return rewards.tolist()
+
+    def _set_eval_options(self, cfg):
+        """Guidance table, density gate and dflow of the new multi_planner, as the C++ Follower's init does."""
+        gate = cfg.guidance_gate_rho0 is not None or cfg.guidance_gate_rho1 is not None
+        if cfg.guidance_dir is not None:
+            from follower_cpp.guidance import load_table
+            table = load_table(cfg.guidance_dir, self.obstacles, len(self.starts))
+            self.planner.set_guidance(table.ravel().tolist())
+        if gate:
+            assert cfg.guidance_dir is not None, 'the density gate needs guidance_dir'
+            assert cfg.guidance_gate_rho0 is not None and cfg.guidance_gate_rho1 is not None
+            assert cfg.guidance_gate_rho1 > cfg.guidance_gate_rho0
+            self.planner.set_guidance_gate(cfg.guidance_gate_rho0, cfg.guidance_gate_rho1, cfg.guidance_gate_halflife)
+        if cfg.dflow != 'off':
+            self.planner.set_dflow(DFLOW_MODES[cfg.dflow], cfg.dflow_with, cfg.dflow_opp)
+        dump = (f'[planner config python] static={cfg.use_static_cost} dynamic={cfg.use_dynamic_cost} '
+                f'reset={cfg.reset_dynamic_cost} crisscross_ratio={cfg.crisscross_ratio} '
+                f'crisscross_all={cfg.crisscross_all} guidance_dir={cfg.guidance_dir} guidance_gate={gate} '
+                f'gate_rho0={cfg.guidance_gate_rho0} gate_rho1={cfg.guidance_gate_rho1} '
+                f'gate_halflife={cfg.guidance_gate_halflife} dflow={cfg.dflow} dflow_with={cfg.dflow_with} '
+                f'dflow_opp={cfg.dflow_opp} fix_soft_positions={os.environ.get("LTF_FIX_SOFT_POSITIONS")}')
+        if dump not in _CONFIGS_DUMPED:
+            _CONFIGS_DUMPED.add(dump)
+            print(dump, flush=True)
 
 
 class ResettablePlanner:

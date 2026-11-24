@@ -116,12 +116,77 @@ std::vector<float> Follower::generate_input(int a_id, int radius, std::list<std:
     return input;
 }
 
+// Density gate of one agent from its own observation only: rho = the other agents in its cfg.obs_radius window (the
+// cells get_occupied_cells reads, as the agents channel / the dynamic cost see them) / the free cells of the window
+// other than its own; smoothed by an EMA (gate_alpha, first step: rho itself); g = clip((rho - rho0) / (rho1 - rho0)).
+float Follower::update_gate(size_t agent_idx, size_t num_others)
+{
+    const auto& pos = agents[agent_idx].cur_position;
+    int free_cells = 0;
+    for(int i = pos.first - cfg.obs_radius; i <= pos.first + cfg.obs_radius; i++)
+        for(int j = pos.second - cfg.obs_radius; j <= pos.second + cfg.obs_radius; j++)
+            if(grid[i][j] == 0 && std::make_pair(i, j) != pos)
+                free_cells++;
+    float rho = free_cells > 0 ? static_cast<float>(num_others) / free_cells : 0.f;
+    float& ema = rho_ema[agent_idx];
+    ema = ema < 0.f ? rho : ema + gate_alpha * (rho - ema);
+    float g = (ema - cfg.gate_rho0) / (cfg.gate_rho1 - cfg.gate_rho0);
+    gates[agent_idx] = std::min(1.f, std::max(0.f, g));
+    return gates[agent_idx];
+}
+
 // Network input of one agent, 2 (4 with cfg.use_memory) x (2r+1) x (2r+1): obstacles (-1) and the re-planned A* path
 // (+1), other agents, and the memory channels.
+// cfg.dflow: the moves of other agents that agent_idx can infer from its own last two views (agents carry no identity),
+// added to its planner's flow after update_occupied_cells, i.e. after a goal-change reset, like the occupations. A move
+// u -> v is credited when, with r = cfg.obs_radius:
+//   - v (in the current window, not the own cell) is occupied now and was in the previous window but not occupied by
+//     another agent then (an agent seen on v on both steps may have stayed: no flow);
+//   - every free 4-neighbour of v was in the previous window (else the source may have been unseen);
+//   - exactly one of them, u, was occupied by another agent then (the agent's own previous cell does not count).
+// Everything else (several candidate sources, unseen neighbours) is skipped as ambiguous.
+void Follower::add_observed_flow(size_t agent_idx)
+{
+    const int r = cfg.obs_radius;
+    const int H = grid.size(), W = grid.front().size();
+    const auto cur = agents[agent_idx].cur_position, prev = prev_positions[agent_idx];
+    auto seen_prev = [&](int i, int j) { return std::abs(i - prev.first) <= r && std::abs(j - prev.second) <= r; };
+    auto other_prev = [&](int i, int j) {
+        return seen_prev(i, j) && std::make_pair(i, j) != prev && prev_agents_pos[i][j];
+    };
+    static const int DIRS[4][2] = {{0, 1}, {1, 0}, {-1, 0}, {0, -1}};  // planner.h d4: east, south, north, west
+    for(int i = cur.first - r; i <= cur.first + r; i++)
+        for(int j = cur.second - r; j <= cur.second + r; j++)
+        {
+            if(i < 0 || j < 0 || i >= H || j >= W || !agents_pos[i][j] || std::make_pair(i, j) == cur)
+                continue;
+            if(!seen_prev(i, j) || other_prev(i, j))
+                continue;
+            int num_sources = 0, src_i = -1, src_j = -1;
+            bool unseen = false;
+            for(const auto& d : DIRS)
+            {
+                int ui = i - d[0], uj = j - d[1];
+                if(ui < 0 || uj < 0 || ui >= H || uj >= W || grid[ui][uj])
+                    continue;
+                if(!seen_prev(ui, uj)) { unseen = true; break; }
+                if(other_prev(ui, uj)) { num_sources++; src_i = ui; src_j = uj; }
+            }
+            if(!unseen && num_sources == 1)
+                planners[agent_idx].add_observed_move({src_i, src_j}, {i, j});
+        }
+}
+
+// With both the density gate and dflow on, the gate is set first (it only reads the occupied cells), then the
+// occupations and the flow are updated, then the path is planned with both.
 std::vector<float> Follower::observe(size_t agent_idx, int radius)
 {
     std::list<std::pair<int, int>> occupied_cells = get_occupied_cells(agent_idx);
+    if(cfg.guidance_gate)
+        planners[agent_idx].set_gate(update_gate(agent_idx, occupied_cells.size()));
     planners[agent_idx].update_occupied_cells(occupied_cells, agents[agent_idx].goal);
+    if(dflow_on && has_prev_state)
+        add_observed_flow(agent_idx);
     planners[agent_idx].update_path(agents[agent_idx].cur_position, agents[agent_idx].goal);
     return generate_input(agent_idx, radius, planners[agent_idx].get_path());
 }
@@ -160,6 +225,14 @@ void Follower::set_state(std::vector<std::pair<int, int>> cur_positions, std::ve
             position_history.pop_back();
             agents_pos_history.pop_back();
         }
+    }
+    if(dflow_on && has_state)  // the view of the previous step, for add_observed_flow
+    {
+        prev_agents_pos = agents_pos;
+        prev_positions.resize(agents.size());
+        for(size_t agent_idx = 0; agent_idx < agents.size(); agent_idx++)
+            prev_positions[agent_idx] = agents[agent_idx].cur_position;
+        has_prev_state = true;
     }
     has_state = true;
     // Cleared and set one agent at a time, in index order, like pogema's soft collision system: an agent that moved
@@ -230,6 +303,21 @@ void Follower::init(const Config& cfg_, py::array_t<double> array, std::vector<s
     agents_pos_history.clear();
     position_history.clear();
     has_state = false;
+    has_prev_state = false;
+    prev_agents_pos.clear();
+    prev_positions.clear();
+    int dflow_mode;
+    if(cfg.dflow == "off")
+        dflow_mode = 0;
+    else if(cfg.dflow == "add")
+        dflow_mode = 1;
+    else if(cfg.dflow == "split")
+        dflow_mode = 2;
+    else if(cfg.dflow == "ggboost")
+        dflow_mode = 3;
+    else
+        throw std::invalid_argument("dflow: '" + cfg.dflow + "' is not one of off, add, split, ggboost");
+    dflow_on = dflow_mode != 0;
     // the input channels in network order (ConcatPositionalFeatures), for cfg.ablate_channels
     std::vector<std::string> channels = {"obstacles", "agents"};
     if(cfg.use_memory)
@@ -248,6 +336,21 @@ void Follower::init(const Config& cfg_, py::array_t<double> array, std::vector<s
     planners.clear();
     planner temp_planner(grid, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost);
     auto pen_matrix = temp_planner.precompute_penalty_matrix(cfg.obs_radius);
+    // one guidance table shared by all planners (validated once, by the first planner)
+    std::shared_ptr<const std::vector<float>> guidance, guidance_log;
+    if(!cfg.guidance_table.empty())
+        guidance = std::make_shared<const std::vector<float>>(cfg.guidance_table);
+    rho_ema.assign(agents.size(), -1.f);
+    gates.assign(agents.size(), 1.f);
+    if(cfg.guidance_gate)
+    {
+        if(!guidance)
+            throw std::invalid_argument("guidance_gate needs a guidance_table");
+        if(!(cfg.gate_rho1 > cfg.gate_rho0))
+            throw std::invalid_argument("guidance_gate needs gate_rho1 > gate_rho0");
+        guidance_log = planner::log_table(guidance);
+        gate_alpha = cfg.gate_halflife > 0.f ? 1.f - std::pow(2.f, -1.f / cfg.gate_halflife) : 1.f;
+    }
     for(size_t agent_idx = 0; agent_idx < agents.size(); agent_idx++)
     {
         agents[agent_idx].offset = abs_starts[agent_idx];
@@ -255,6 +358,10 @@ void Follower::init(const Config& cfg_, py::array_t<double> array, std::vector<s
         planners.emplace_back(grid, cfg.use_static_cost, cfg.use_dynamic_cost, cfg.reset_dynamic_cost);
         planners.back().set_penalties(pen_matrix);
         planners.back().set_crisscross(cfg.crisscross_ratio, cfg.crisscross_all);
+        planners.back().set_guidance_shared(guidance);
+        planners.back().set_guidance_gate_shared(guidance_log);
+        if(dflow_on)
+            planners.back().set_dflow(dflow_mode, cfg.dflow_with, cfg.dflow_opp);
         generators[agent_idx].seed(cfg.seed);
     }
 }
@@ -267,6 +374,9 @@ py::class_<Follower>(m, "Follower")
 .def("set_state", &Follower::set_state)
 .def("set_actions", &Follower::set_actions)
 .def("observe", &Follower::observe)
+.def("get_gates", &Follower::get_gates)
+.def("get_flow", &Follower::get_flow)
+.def("get_occupations", &Follower::get_occupations)
 ;
 }
 

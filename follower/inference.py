@@ -62,6 +62,18 @@ class FollowerInferenceConfig(AlgoBase, extra=Extra.forbid):
     override_config: Optional[dict] = None
     training_config: Optional[Experiment] = None
     custom_path_to_weights: Optional[str] = None
+    # Eval-time planner options (None / defaults: the model's training preprocessing), applied on top of
+    # training_config.preprocessing by follower_preprocessor; see follower/planning.py PlannerConfig. FollowerConfigCPP
+    # declares the same names for the C++ path.
+    crisscross_ratio: Optional[float] = None
+    crisscross_all: Optional[bool] = None
+    guidance_dir: Optional[str] = None
+    guidance_gate_rho0: Optional[float] = None
+    guidance_gate_rho1: Optional[float] = None
+    guidance_gate_halflife: float = 4.0
+    dflow: Literal['off', 'add', 'split', 'ggboost'] = 'off'
+    dflow_with: float = 1.0
+    dflow_opp: float = 1.0
 
     @classmethod
     def recursive_dict_update(cls, original_dict, update_dict):
